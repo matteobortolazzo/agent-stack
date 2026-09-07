@@ -36,6 +36,11 @@ func greenAutomergeInputs() automergeInputs {
 		ReviewsComplete:  true,
 		IsDraft:          false,
 		Mergeable:        "MERGEABLE",
+		// MergeStateStatus "CLEAN" (#995) is GitHub's ordinary green-mergeable
+		// pairing with Mergeable == "MERGEABLE" -- neither "DIRTY" nor
+		// "BEHIND", so it never perturbs any pre-#995 condition-matrix case
+		// that leaves it untouched.
+		MergeStateStatus: "CLEAN",
 		HeadRefOID:       "abc",
 		ChangedFiles:     2,
 		Additions:        10,
@@ -298,7 +303,39 @@ func TestEvaluateAutomergeConditionMatrix(t *testing.T) {
 		{"unsupported review feedback type", func(in *automergeInputs) { in.FeedbackHold = reasonFeedbackUnsupported }, reasonFeedbackUnsupported},
 		{"draft PR", func(in *automergeInputs) { in.IsDraft = true }, reasonDraft},
 		{"mergeable state UNKNOWN", func(in *automergeInputs) { in.Mergeable = "UNKNOWN" }, reasonMergeableUnknown},
-		{"mergeable state CONFLICTING", func(in *automergeInputs) { in.Mergeable = "CONFLICTING" }, reasonNotMergeable},
+		// #995: the mergeable-stage reason now refines by MergeStateStatus,
+		// never by Mergeable itself -- DIRTY (the real-world pairing with
+		// CONFLICTING) maps to the distinct reasonMergeConflicts, not the
+		// generic reasonNotMergeable this case used to pin.
+		{"mergeable state CONFLICTING with mergeStateStatus DIRTY maps to reasonMergeConflicts", func(in *automergeInputs) {
+			in.Mergeable = "CONFLICTING"
+			in.MergeStateStatus = "DIRTY"
+		}, reasonMergeConflicts},
+		// #995 regression: an empty/unrecognized mergeStateStatus alongside a
+		// non-MERGEABLE Mergeable value must still fall back to the generic
+		// reasonNotMergeable -- pinning that the refinement never keys on
+		// Mergeable itself, only on MergeStateStatus (the plan's Assumption).
+		{"mergeable state CONFLICTING with empty mergeStateStatus stays reasonNotMergeable", func(in *automergeInputs) {
+			in.Mergeable = "CONFLICTING"
+			in.MergeStateStatus = ""
+		}, reasonNotMergeable},
+		// #995: MergeStateStatus == "BEHIND" on a non-MERGEABLE PR maps to the
+		// distinct reasonBranchBehind -- not reachable from real GitHub state
+		// (BEHIND pairs with an otherwise-MERGEABLE PR, which bypasses this
+		// branch entirely, per the ticket's Decision), so only this pure case
+		// covers it.
+		{"mergeable state BLOCKED with mergeStateStatus BEHIND maps to reasonBranchBehind", func(in *automergeInputs) {
+			in.Mergeable = "BLOCKED"
+			in.MergeStateStatus = "BEHIND"
+		}, reasonBranchBehind},
+		// #995 no-regression: Mergeable == "UNKNOWN" must still win outright,
+		// even when MergeStateStatus independently reads "DIRTY" -- the
+		// pre-#995 UNKNOWN check stays untouched and ordered ahead of the new
+		// MergeStateStatus switch.
+		{"mergeable state UNKNOWN outranks mergeStateStatus DIRTY (no regression)", func(in *automergeInputs) {
+			in.Mergeable = "UNKNOWN"
+			in.MergeStateStatus = "DIRTY"
+		}, reasonMergeableUnknown},
 		{"head commit SHA unknown", func(in *automergeInputs) { in.HeadRefOID = "" }, reasonHeadSHAUnknown},
 		{"no changed files", func(in *automergeInputs) { in.ChangedFiles = 0 }, reasonNoChanges},
 		{"diff file list truncated", func(in *automergeInputs) { in.Files = in.Files[:1] }, reasonDiffTruncated},
@@ -1843,7 +1880,12 @@ func TestTickAutomergePreMergeRecheckHoldsOnChangedEvidence(t *testing.T) {
 	greenLabels := `{"labels":[{"name":"automerge:ok"}]}`
 	greenPolicy := `{"automerge":{"maxChangedFiles":10,"maxDiffLines":500,"mergeMethod":"squash"}}`
 	greenQueue := queueProbeResponse(false, false, "abc")
-	conflictingPR := `{"number":42,"title":"Change","state":"OPEN","headRefName":"feature","headRefOid":"abc","baseRefName":"main","mergeable":"CONFLICTING","isDraft":false,"changedFiles":1,"additions":5,"deletions":2,"files":[{"path":"watch/internal/babysit/x.go"}],"url":"https://example/pr/42","closingIssuesReferences":[{"number":9}]}`
+	// #995: mergeStateStatus DIRTY is the real-world pairing with mergeable
+	// CONFLICTING -- carrying it here pins merge.go's recheckAutomergeInputs
+	// wiring (MergeStateStatus: pr.MergeStateStatus onto automergeInputs): a
+	// pure evaluateAutomerge test cannot catch an unwired struct field, only
+	// this tick-level recheck path can (root AGENTS.md #824).
+	conflictingPR := `{"number":42,"title":"Change","state":"OPEN","headRefName":"feature","headRefOid":"abc","baseRefName":"main","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","isDraft":false,"changedFiles":1,"additions":5,"deletions":2,"files":[{"path":"watch/internal/babysit/x.go"}],"url":"https://example/pr/42","closingIssuesReferences":[{"number":9}]}`
 
 	for _, tc := range []struct {
 		name                                                 string
@@ -1854,7 +1896,7 @@ func TestTickAutomergePreMergeRecheckHoldsOnChangedEvidence(t *testing.T) {
 		{"a check flips to fail since evaluation", greenPR, `[{"bucket":"fail","name":"test","state":"FAILURE"}]`, greenComments, greenReviews, greenLabels, greenPolicy, greenQueue, reasonCICheckFailed},
 		{"a new non-bot review comment appears since evaluation", greenPR, greenChecks, `[{"id":77,"updated_at":"2026-01-02T00:00:00Z","user":{"login":"reviewer"}}]`, greenReviews, greenLabels, greenPolicy, greenQueue, reasonReviewPending},
 		{"base-ref policy tightened since evaluation", greenPR, greenChecks, greenComments, greenReviews, greenLabels, `{"automerge":{"maxChangedFiles":10,"maxDiffLines":1,"mergeMethod":"squash"}}`, greenQueue, reasonTooManyLines},
-		{"mergeable flips to CONFLICTING since evaluation", conflictingPR, greenChecks, greenComments, greenReviews, greenLabels, greenPolicy, greenQueue, reasonNotMergeable},
+		{"mergeable flips to CONFLICTING (mergeStateStatus DIRTY) since evaluation", conflictingPR, greenChecks, greenComments, greenReviews, greenLabels, greenPolicy, greenQueue, reasonMergeConflicts},
 		{"merge queue turns on since evaluation", greenPR, greenChecks, greenComments, greenReviews, greenLabels, greenPolicy, queueProbeResponse(true, false, "abc"), reasonMergeQueueRequired},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

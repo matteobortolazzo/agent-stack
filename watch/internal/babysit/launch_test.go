@@ -180,6 +180,20 @@ func TestLaunchPassesRecordedSessionAndDir(t *testing.T) {
 			responses: []string{openPR(), `[]`, `[{"id":7,"updated_at":"2026-01-02T00:00:00Z","user":{"login":"reviewer"}}]`, `[]`, unresolvedThreadFor(7)},
 			workflow:  "address-review",
 		},
+		{
+			// #995: the conflict-escalation launch site, alongside the
+			// existing FixAttempts: fixCap attention case above -- unlike
+			// that case, the conflict path never returns errNeedsInput
+			// (wantNeedsInput stays false, the ticket's Decision).
+			name: "babysit-attention-conflict",
+			state: State{
+				PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900,
+				LastHeadSHA:   "abc",
+				LaunchSession: "work", LaunchDir: "/repo/root",
+			},
+			responses: []string{conflictingOpenPR("abc"), `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`, `[]`, `[]`},
+			workflow:  "babysit-attention",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls [][]string
@@ -241,6 +255,46 @@ func TestLaunchFailsWhenRecordedSessionGone(t *testing.T) {
 	}
 	if s.AutomergeReason != reasonWorkflowLaunchFailed {
 		t.Fatalf("AutomergeReason = %q, want %q", s.AutomergeReason, reasonWorkflowLaunchFailed)
+	}
+}
+
+// TestLaunchFailsForConflictWhenRecordedSessionGone is #995's conflict-path
+// analogue of TestLaunchFailsWhenRecordedSessionGone: a DIRTY PR whose
+// recorded tmux session no longer exists must fail the babysit-attention
+// launch loudly, issue zero `cenci run` calls, leave ConflictNotifiedSHA
+// unset (so the next tick retries), and persist
+// AutomergeReason == reasonWorkflowLaunchFailed through the existing
+// recordUpstreamReadFailure retry path.
+func TestLaunchFailsForConflictWhenRecordedSessionGone(t *testing.T) {
+	withFleetAutomergeEnabled(t, true)
+	var calls [][]string
+	withCommands(t, []string{conflictingOpenPR("abc"), `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`}, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(session string) (bool, error) { return false, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900,
+		LastHeadSHA:   "abc",
+		LaunchSession: "gone-session", LaunchDir: "/repo/dir",
+	}
+	_, _, err := tick(&s)
+	if err == nil {
+		t.Fatal("tick: err = nil, want the missing recorded session to fail the conflict-path launch")
+	}
+	if !strings.Contains(err.Error(), "gone-session") {
+		t.Fatalf("tick err = %q, want it to name the recorded session %q", err.Error(), "gone-session")
+	}
+	for _, c := range calls {
+		if len(c) > 1 && c[1] == "run" {
+			t.Fatalf("no cenci run call must be made when the recorded session is gone: %#v", calls)
+		}
+	}
+	if s.AutomergeReason != reasonWorkflowLaunchFailed {
+		t.Fatalf("AutomergeReason = %q, want %q", s.AutomergeReason, reasonWorkflowLaunchFailed)
+	}
+	if s.ConflictNotifiedSHA != "" {
+		t.Fatalf("ConflictNotifiedSHA = %q, want empty: a failed launch must never record the dedup marker", s.ConflictNotifiedSHA)
 	}
 }
 

@@ -397,7 +397,7 @@ it was evaluated.
 | `label` | Per-ticket grant | The PR closes no issue, an issue's labels are unreadable, or any closed issue lacks `automerge:ok` |
 | `ci` | CI green (≥1 `pass`, rest `pass`/`skipping`) | No checks reported, zero `pass` with the rest `skipping`, or any check's bucket is `fail`, `pending`, `cancel`, empty, or unrecognized |
 | `review` | Feedback | CI repair in flight, pending feedback, a reopened resolution, or a detection read that couldn't be proven complete |
-| `mergeable` | PR state | Draft, `MERGEABLE` unknown, or not mergeable |
+| `mergeable` | PR state | Draft, `MERGEABLE` unknown, or not mergeable (`PR has merge conflicts` when `mergeStateStatus` is `DIRTY`, `PR branch is behind base` when `BEHIND`) |
 | `headsha` | Head commit | The PR's head SHA is unreadable at evaluation time |
 | `files` | Diff readability | Zero changed files, or a truncated file list |
 | `policy` | Policy block | `.cenci/config.json` on the base branch is unreadable, absent, or malformed |
@@ -422,6 +422,10 @@ Three reasons need a human and will not clear on their own: `review feedback sta
 unreadable`, `review feedback state unknown` (GitHub stopped reporting a comment or
 thread — deleted or purged), and `unsupported review feedback type`. Merge those by
 hand.
+
+`PR has merge conflicts` also needs a human, but unlike the three above it is not
+permanent: babysit keeps polling at its normal interval, and once someone pushes a
+rebase the hold clears on its own on the next tick — no re-arm required.
 
 ## Knowing a merge was automatic
 
@@ -481,6 +485,9 @@ Accepted and documented, not bugs:
 - **Merge state can lag by one supervision interval.** babysit re-evaluates on its own
   cadence (`babysitInterval`, default `15m`), so a PR can sit merge-ready for up to one
   interval.
+- **A merely-`BEHIND` branch is not auto-updated.** babysit observes and reports `PR
+  branch is behind base`, but performs no branch mutation — pushing the rebase remains a
+  manual step (`/cenci:sync`).
 
 ## Where the details live
 

@@ -97,6 +97,7 @@ func recheckAutomergeInputs(s *State, first automergeInputs) (automergeInputs, s
 		FeedbackDetail:    verdict.Detail,
 		IsDraft:           pr.IsDraft,
 		Mergeable:         pr.Mergeable,
+		MergeStateStatus:  pr.MergeStateStatus,
 		HeadRefOID:        pr.HeadRefOID,
 		ChangedFiles:      pr.ChangedFiles,
 		Additions:         pr.Additions,

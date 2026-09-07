@@ -72,7 +72,7 @@ const (
 // the exact `--json` field list every `gh pr view` call in package babysit
 // requests, needed here (this package cannot import babysit's unexported
 // constant) to build the exact-argv assertions AC1 requires.
-const chainPRViewFields = "number,title,state,headRefName,headRefOid,mergedAt,closingIssuesReferences,url,baseRefName,mergeable,isDraft,changedFiles,additions,deletions,files"
+const chainPRViewFields = "number,title,state,headRefName,headRefOid,mergedAt,closingIssuesReferences,url,baseRefName,mergeable,mergeStateStatus,isDraft,changedFiles,additions,deletions,files"
 
 // chainInvocationsWithPrefix generalizes chainMergeInvocations
 // (chain_e2e_test.go, which stays untouched and keeps its own narrower "pr

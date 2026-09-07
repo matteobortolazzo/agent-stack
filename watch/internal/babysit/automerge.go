@@ -44,10 +44,21 @@ const (
 	// dismissed/superseded CHANGES_REQUESTED review became blocking again),
 	// never for an ordinary first-time pending key. Carries the reopened
 	// key name(s) in Detail (Q2).
-	reasonFeedbackReopened      = "review feedback reopened"
-	reasonDraft                 = "PR is a draft"
-	reasonMergeableUnknown      = "mergeable state unknown"
-	reasonNotMergeable          = "PR not mergeable"
+	reasonFeedbackReopened = "review feedback reopened"
+	reasonDraft            = "PR is a draft"
+	reasonMergeableUnknown = "mergeable state unknown"
+	reasonNotMergeable     = "PR not mergeable"
+	// reasonMergeConflicts and reasonBranchBehind (#995) refine the
+	// mergeable stage's catch-all reasonNotMergeable, keyed only on
+	// MergeStateStatus (never on Mergeable itself, per the ticket's
+	// Assumption): DIRTY (the real-world pairing with Mergeable ==
+	// CONFLICTING) yields reasonMergeConflicts; BEHIND yields
+	// reasonBranchBehind. Any other non-MERGEABLE state, including an
+	// empty/unrecognized MergeStateStatus, still falls back to
+	// reasonNotMergeable -- kept as the catch-all so no existing consumer
+	// loses its match.
+	reasonMergeConflicts        = "PR has merge conflicts"
+	reasonBranchBehind          = "PR branch is behind base"
 	reasonHeadSHAUnknown        = "PR head commit SHA unknown"
 	reasonNoChanges             = "PR has no changed files"
 	reasonDiffTruncated         = "diff file list truncated"
@@ -322,6 +333,11 @@ type automergeInputs struct {
 
 	IsDraft   bool
 	Mergeable string
+	// MergeStateStatus (#995) refines the mergeable stage's reason when
+	// Mergeable != "MERGEABLE": see reasonMergeConflicts/reasonBranchBehind
+	// above. Never consulted when Mergeable == "MERGEABLE" or "UNKNOWN" --
+	// those two checks stay ordered ahead of it, untouched.
+	MergeStateStatus string
 	// HeadRefOID is the PR's head commit SHA at the moment the condition
 	// chain was evaluated -- runAutomerge pins `gh pr merge` to this exact
 	// value via --match-head-commit (the TOCTOU guard). An empty value here
@@ -559,7 +575,18 @@ func evaluateAutomerge(in automergeInputs) automergeDecision {
 		return fail("mergeable", reasonMergeableUnknown)
 	}
 	if in.Mergeable != "MERGEABLE" {
-		return fail("mergeable", reasonNotMergeable)
+		// #995: refine the reason by MergeStateStatus alone -- never by
+		// Mergeable itself, so an empty/unrecognized status still falls
+		// back to the generic reasonNotMergeable (the regression case the
+		// plan's Assumption pins).
+		switch in.MergeStateStatus {
+		case "DIRTY":
+			return fail("mergeable", reasonMergeConflicts)
+		case "BEHIND":
+			return fail("mergeable", reasonBranchBehind)
+		default:
+			return fail("mergeable", reasonNotMergeable)
+		}
 	}
 	pass("mergeable")
 
@@ -1122,6 +1149,7 @@ func runAutomerge(s *State, pr prView, checks []check, verdict feedbackVerdict, 
 		FeedbackDetail:   verdict.Detail,
 		IsDraft:          pr.IsDraft,
 		Mergeable:        pr.Mergeable,
+		MergeStateStatus: pr.MergeStateStatus,
 		HeadRefOID:       pr.HeadRefOID,
 		ChangedFiles:     pr.ChangedFiles,
 		Additions:        pr.Additions,
