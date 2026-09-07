@@ -227,7 +227,7 @@ be noise, not signal.
 
 | AC | Claim | Test |
 |---|---|---|
-| 1 | This repository explicitly authorizes lean planning while missing or malformed authorization remains fail-closed in the runtime implemented by the split. | `flow/tests/repo-activation-config.test.sh`, `TestRunOnce_LeanRepoConfigPassesAutonomyGate` |
+| 1 | This repository states its planning autonomy explicitly (one of the two documented values) while missing or malformed authorization remains fail-closed in the runtime implemented by the split. | `flow/tests/repo-activation-config.test.sh`, `TestRunOnce_LeanRepoConfigPassesAutonomyGate` |
 | 2 | Flow, watch, and sandbox each have positive bounded squash policies, while root-owned files remain ineligible without a top-level policy. | `flow/tests/repo-activation-config.test.sh`, `TestRepositoryAutomergePolicyDogfood` |
 | 3 | Representative control-plane, runtime, and supply-chain paths are protected through the production matcher; representative docs and tests remain eligible. | `TestRepositoryAutomergePolicyDogfood` |
 | 4 | Config-only changes trigger both the authored-config contract and the production policy-resolver dogfood test in CI. | `flow/tests/repo-activation-config.test.sh` |

@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Dogfood contract for issue #661. The repository must explicitly authorize
-# lean planning and bounded per-project automerge while root-owned files stay
-# fail-closed through the intentional absence of a top-level policy.
+# Dogfood contract for issue #661. The repository must state its planning
+# autonomy explicitly and authorize bounded per-project automerge while
+# root-owned files stay fail-closed through the intentional absence of a
+# top-level policy.
+#
+# The autonomy assertion pins explicitness, not a particular mode: which of
+# the two documented values this repo commits is a per-repo operational
+# choice (it moved from "lean" to "interactive" in #1161), but an absent
+# `planning` block or an unrecognized value must never pass -- those are the
+# shapes that silently resolve to a default nobody chose.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || {
@@ -27,8 +34,8 @@ if [[ ! -f "${CONFIG}" ]]; then
 elif ! jq empty "${CONFIG}" >/dev/null 2>&1; then
   fail "repository config is not valid JSON: ${CONFIG}"
 else
-  jq -e '.planning.autonomy == "lean"' "${CONFIG}" >/dev/null 2>&1 ||
-    fail "planning.autonomy must explicitly authorize lean planning"
+  jq -e '.planning.autonomy == "lean" or .planning.autonomy == "interactive"' "${CONFIG}" >/dev/null 2>&1 ||
+    fail "planning.autonomy must be explicitly set to one of the documented values (\"lean\" or \"interactive\")"
 
   jq -e 'has("automerge") | not' "${CONFIG}" >/dev/null 2>&1 ||
     fail "top-level automerge must stay absent so root-owned files fail closed"
