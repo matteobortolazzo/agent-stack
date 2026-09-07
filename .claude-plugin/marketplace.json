@@ -8,7 +8,7 @@
       "name": "cenci",
       "source": "./flow",
       "description": "cenci workflow layer: portable engineering conventions and Claude Code's gated GitHub ticket-to-PR pipeline",
-      "version": "1.2.4",
+      "version": "1.2.5",
       "author": {
         "name": "Matteo Bortolazzo"
       },
