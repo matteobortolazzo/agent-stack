@@ -2614,3 +2614,396 @@ func TestBlocksCloseIgnoresSupervisorLogFiles(t *testing.T) {
 		t.Errorf("reason = %q, want it to name PR #790", reason)
 	}
 }
+
+// -- #995: supervisor observes and escalates a merge-conflicted PR ----------
+//
+// conflictWindowOpenedMarker/conflictStillOpenMarker are the two distinct
+// substrings the conflict-escalation branch's stdout lines must carry: the
+// first-notification line (a new babysit-attention window opened) versus the
+// already-notified, same-head-SHA line (AC "prints a distinct
+// still-conflicting line"). Asserting both markers' presence/absence in each
+// test below pins that the two lines are genuinely distinguishable, not just
+// that *a* conflict-shaped line exists.
+const (
+	conflictWindowOpenedMarker = "opened babysit-attention"
+	conflictStillOpenMarker    = "already notified"
+)
+
+// conflictingOpenPR is an OPEN PR fixture with mergeStateStatus DIRTY --
+// #995's escalation-trigger predicate. mergeable CONFLICTING is paired with
+// it the way real GitHub state reports it; headRefOid is parameterized so
+// the dedup/re-arm tests below can control the head-SHA comparison
+// explicitly.
+func conflictingOpenPR(headSHA string) string {
+	return fmt.Sprintf(`{"number":42,"title":"Change","state":"OPEN","headRefName":"feature","headRefOid":%q,"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","url":"https://example/pr/42","closingIssuesReferences":[]}`, headSHA)
+}
+
+// cleanOpenPR is an OPEN PR fixture with mergeStateStatus CLEAN (not
+// conflicting) -- #995's conflict-cleared release case needs a PR whose
+// conflict has resolved since the previous tick.
+func cleanOpenPR(headSHA string) string {
+	return fmt.Sprintf(`{"number":42,"title":"Change","state":"OPEN","headRefName":"feature","headRefOid":%q,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","url":"https://example/pr/42","closingIssuesReferences":[]}`, headSHA)
+}
+
+// countWorkflowLaunches counts how many recorded calls are a `cenci run
+// <workflow>` launch -- generalizes countAddressReviewLaunches (#885) to any
+// workflow name, for #995's conflict-escalation tests below.
+func countWorkflowLaunches(calls [][]string, workflow string) int {
+	n := 0
+	for _, c := range calls {
+		if len(c) > 2 && c[1] == "run" && c[2] == workflow {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPrConflictingTable pins prConflicting's fail-safe OR predicate (#995's
+// Assumptions): MergeStateStatus == "DIRTY" is authoritative on its own;
+// Mergeable == "CONFLICTING" only falls back to conflicting when
+// MergeStateStatus is empty or "UNKNOWN" -- a narrow fail-safe, per
+// watch/AGENTS.md's rule against broadening a match-miss into a silent
+// catch-all. Any other non-empty, recognized status (e.g. BLOCKED) is
+// authoritative and NOT conflicting -- pinned by its own regression case, as
+// that rule requires.
+func TestPrConflictingTable(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		mergeable        string
+		mergeStateStatus string
+		want             bool
+	}{
+		{"DIRTY is conflicting regardless of mergeable", "CONFLICTING", "DIRTY", true},
+		{"CONFLICTING with empty mergeStateStatus falls back to conflicting", "CONFLICTING", "", true},
+		{"CONFLICTING with mergeStateStatus UNKNOWN falls back to conflicting", "CONFLICTING", "UNKNOWN", true},
+		{"CONFLICTING with mergeStateStatus BLOCKED is NOT conflicting (regression: a recognized non-DIRTY status is authoritative)", "CONFLICTING", "BLOCKED", false},
+		{"MERGEABLE with empty mergeStateStatus is not conflicting", "MERGEABLE", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := prView{Mergeable: tc.mergeable, MergeStateStatus: tc.mergeStateStatus}
+			if got := prConflicting(pr); got != tc.want {
+				t.Fatalf("prConflicting(mergeable=%q, mergeStateStatus=%q) = %v, want %v", tc.mergeable, tc.mergeStateStatus, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTickConflictingDIRTYLaunchesBabysitAttentionOnce is #995's
+// Implementation Order step 1 red test (the ticket's core Acceptance
+// Criteria): a DIRTY PR with green CI and an unchanged head SHA must not be
+// quietly backed off. tick() must observe the conflict, launch exactly one
+// babysit-attention window, set Status = "needs-input", stay actionable
+// (delay pinned at IntervalSeconds, never doubled), record the
+// ConflictNotifiedSHA dedup marker, and print the window-opened conflict
+// line instead of the "quiet — no new actionable work" backoff line --
+// asserting both the presence of the conflict line and the absence of the
+// quiet line, so an empty stdout capture cannot pass vacuously. Automerge
+// stays disabled (TestMain's default seam), pinning that the escalation
+// fires independently of automerge.enabled (AC 2). Uses the os.Pipe
+// stdout-capture pattern from
+// TestTickMergedGapReportHoldIsTerminalWithDistinguishableStdoutLine.
+func TestTickConflictingDIRTYLaunchesBabysitAttentionOnce(t *testing.T) {
+	var calls [][]string
+	withCommands(t, []string{conflictingOpenPR("abc"), `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`, `[]`, `[]`}, &calls)
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900, LastHeadSHA: "abc", LaunchSession: "work"}
+
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = w
+	terminal, delay, err := tick(&s)
+	_ = w.Close()
+	os.Stdout = originalStdout
+	out, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatalf("read captured stdout: %v", readErr)
+	}
+
+	if err != nil || terminal {
+		t.Fatalf("tick = terminal %v, err %v, want terminal false, err nil", terminal, err)
+	}
+	if delay != 300*time.Second || s.CurrentDelaySeconds != 300 {
+		t.Fatalf("delay = %v, CurrentDelaySeconds = %d, want IntervalSeconds (300s): a conflicting tick must stay actionable, never back off", delay, s.CurrentDelaySeconds)
+	}
+	if s.Status != "needs-input" {
+		t.Fatalf("Status = %q, want %q", s.Status, "needs-input")
+	}
+	if s.ConflictNotifiedSHA != "abc" {
+		t.Fatalf("ConflictNotifiedSHA = %q, want %q: the dedup marker must record the head commit the window was opened for", s.ConflictNotifiedSHA, "abc")
+	}
+	if n := countWorkflowLaunches(calls, "babysit-attention"); n != 1 {
+		t.Fatalf("babysit-attention launches = %d, want exactly 1: %#v", n, calls)
+	}
+	stdout := string(out)
+	if !strings.Contains(stdout, conflictWindowOpenedMarker) {
+		t.Fatalf("tick stdout = %q, want it to contain %q", stdout, conflictWindowOpenedMarker)
+	}
+	if strings.Contains(stdout, conflictStillOpenMarker) {
+		t.Fatalf("tick stdout = %q, want it to NOT contain the still-conflicting line %q on a first notification", stdout, conflictStillOpenMarker)
+	}
+	if strings.Contains(stdout, "quiet — no new actionable work") {
+		t.Fatalf("tick stdout = %q, want no 'quiet' backoff line on a conflicting-but-actionable tick", stdout)
+	}
+}
+
+// TestTickConflictSameSHAStillConflictingOpensNoSecondWindow is #995's
+// Implementation Order step 4 dedup case: a subsequent tick on the same head
+// SHA with the PR still conflicting must not open a second babysit-attention
+// window, must still report actionable = true (delay stays at
+// IntervalSeconds), and must print the distinct still-conflicting line
+// rather than the window-opened line or the "quiet" backoff line.
+func TestTickConflictSameSHAStillConflictingOpensNoSecondWindow(t *testing.T) {
+	var calls [][]string
+	withCommands(t, []string{conflictingOpenPR("abc"), `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`, `[]`, `[]`}, &calls)
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900,
+		LastHeadSHA: "abc", LaunchSession: "work",
+		Status: "needs-input", ConflictNotifiedSHA: "abc",
+	}
+
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = w
+	_, delay, err := tick(&s)
+	_ = w.Close()
+	os.Stdout = originalStdout
+	out, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatalf("read captured stdout: %v", readErr)
+	}
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delay != 300*time.Second || s.CurrentDelaySeconds != 300 {
+		t.Fatalf("delay = %v, CurrentDelaySeconds = %d, want IntervalSeconds (300s): a still-conflicting tick must stay actionable", delay, s.CurrentDelaySeconds)
+	}
+	if n := countWorkflowLaunches(calls, "babysit-attention"); n != 0 {
+		t.Fatalf("babysit-attention launches = %d, want 0: the same head commit must not re-open a window: %#v", n, calls)
+	}
+	if s.ConflictNotifiedSHA != "abc" {
+		t.Fatalf("ConflictNotifiedSHA = %q, want unchanged %q", s.ConflictNotifiedSHA, "abc")
+	}
+	stdout := string(out)
+	if !strings.Contains(stdout, conflictStillOpenMarker) {
+		t.Fatalf("tick stdout = %q, want it to contain %q", stdout, conflictStillOpenMarker)
+	}
+	if strings.Contains(stdout, conflictWindowOpenedMarker) {
+		t.Fatalf("tick stdout = %q, want it to NOT contain the window-opened line %q: no second window opened this tick", stdout, conflictWindowOpenedMarker)
+	}
+	if strings.Contains(stdout, "quiet — no new actionable work") {
+		t.Fatalf("tick stdout = %q, want no 'quiet' backoff line", stdout)
+	}
+}
+
+// TestTickConflictNewHeadSHAReArmsWindow is #995's Implementation Order step
+// 4 re-arm case: once the head SHA changes and the PR is still conflicting,
+// a new babysit-attention window must open even though ConflictNotifiedSHA
+// already holds the *previous* commit -- the dedup key is per-head-SHA, not
+// a one-shot latch.
+func TestTickConflictNewHeadSHAReArmsWindow(t *testing.T) {
+	var calls [][]string
+	withCommands(t, []string{conflictingOpenPR("def"), `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`, `[]`, `[]`}, &calls)
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900,
+		LastHeadSHA: "abc", LaunchSession: "work",
+		Status: "needs-input", ConflictNotifiedSHA: "abc",
+	}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatal(err)
+	}
+	if n := countWorkflowLaunches(calls, "babysit-attention"); n != 1 {
+		t.Fatalf("babysit-attention launches = %d, want exactly 1: a new head commit must re-arm the window: %#v", n, calls)
+	}
+	if s.ConflictNotifiedSHA != "def" {
+		t.Fatalf("ConflictNotifiedSHA = %q, want %q: the marker must advance to the new head commit", s.ConflictNotifiedSHA, "def")
+	}
+	if s.Status != "needs-input" {
+		t.Fatalf("Status = %q, want %q", s.Status, "needs-input")
+	}
+}
+
+// TestTickConflictClearedResetsStatusAndConflictNotifiedSHA is #995's
+// Implementation Order step 4 release case: once a later tick observes the
+// conflict cleared, Status resets to "running" and ConflictNotifiedSHA
+// clears (watch/AGENTS.md #1079's bounded-hold convention) -- and
+// supervisorLive stops treating the PID-0 supervisor as live once that
+// reset lands, so BlocksClose no longer holds `cenci close` open on its
+// behalf.
+func TestTickConflictClearedResetsStatusAndConflictNotifiedSHA(t *testing.T) {
+	var calls [][]string
+	withCommands(t, []string{cleanOpenPR("def"), `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`, `[]`, `[]`}, &calls)
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900,
+		LastHeadSHA: "def", LaunchSession: "work",
+		Status: "needs-input", ConflictNotifiedSHA: "def", PID: 0,
+	}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatal(err)
+	}
+	if s.Status != "running" {
+		t.Fatalf("Status = %q, want %q: the conflict-cleared reset must land", s.Status, "running")
+	}
+	if s.ConflictNotifiedSHA != "" {
+		t.Fatalf("ConflictNotifiedSHA = %q, want empty: cleared on release", s.ConflictNotifiedSHA)
+	}
+	if n := countWorkflowLaunches(calls, "babysit-attention"); n != 0 {
+		t.Fatalf("babysit-attention launches = %d, want 0: a MERGEABLE PR must not escalate: %#v", n, calls)
+	}
+	if supervisorLive(s) {
+		t.Fatal("supervisorLive = true, want false: the reset must stop holding cenci close open for a PID-0, non-arming, non-needs-input supervisor")
+	}
+}
+
+// TestTickConflictPrecedesCIRepairAndRetryCapOnNewSHA is #995's
+// Implementation Order step 5 precedence case (Decision "conflict wins over
+// CI repair/retry-cap"): a tick that sees a conflict AND failing checks AND
+// a changed head SHA launches only babysit-attention -- never ci-repair, and
+// never the retry-cap window's own errNeedsInput -- even once FixAttempts
+// has already reached fixCap. FixAttempts/RepairPending/LastHeadSHA still
+// advance exactly as today's CI-repair bookkeeping would (Q&A 1), including
+// in the at-cap case that today returns early before ever reaching that
+// bookkeeping.
+func TestTickConflictPrecedesCIRepairAndRetryCapOnNewSHA(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		startFixAttempt int
+		wantFixAttempts int
+	}{
+		{"below the retry cap", 0, 1},
+		{"already at the retry cap", fixCap, fixCap + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls [][]string
+			withCommands(t, []string{conflictingOpenPR("new-sha"), `[{"bucket":"fail","name":"test","state":"FAILURE"}]`, `[]`, `[]`}, &calls)
+			s := State{
+				PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900,
+				LastHeadSHA: "old-sha", LaunchSession: "work",
+				FixAttempts: tc.startFixAttempt,
+			}
+			_, _, err := tick(&s)
+			if err != nil {
+				t.Fatalf("tick: %v, want the conflict path to never return errNeedsInput or any other error, even at the retry cap", err)
+			}
+			if n := countWorkflowLaunches(calls, "babysit-attention"); n != 1 {
+				t.Fatalf("babysit-attention launches = %d, want exactly 1: %#v", n, calls)
+			}
+			if n := countWorkflowLaunches(calls, "ci-repair"); n != 0 {
+				t.Fatalf("ci-repair launches = %d, want 0: a conflicting tick must never launch ci-repair: %#v", n, calls)
+			}
+			if s.FixAttempts != tc.wantFixAttempts {
+				t.Fatalf("FixAttempts = %d, want %d: bookkeeping must still advance literally (Q&A 1)", s.FixAttempts, tc.wantFixAttempts)
+			}
+			if !s.RepairPending {
+				t.Fatal("RepairPending = false, want true: bookkeeping must still advance literally (Q&A 1)")
+			}
+			if s.LastHeadSHA != "new-sha" {
+				t.Fatalf("LastHeadSHA = %q, want %q: bookkeeping must still advance literally (Q&A 1)", s.LastHeadSHA, "new-sha")
+			}
+			if s.ConflictNotifiedSHA != "new-sha" {
+				t.Fatalf("ConflictNotifiedSHA = %q, want %q", s.ConflictNotifiedSHA, "new-sha")
+			}
+			if s.Status != "needs-input" {
+				t.Fatalf("Status = %q, want %q", s.Status, "needs-input")
+			}
+		})
+	}
+}
+
+// TestTickConflictAndAddressReviewBothLaunchSameTick is #995 Q&A 2: a
+// conflicting tick with unaddressed review feedback must still launch
+// address-review alongside the conflict escalation -- both windows can open
+// in the same tick, since the conflict escalation's precedence fix only
+// scopes CI-repair/retry-cap, not address-review's own independent dedup
+// state (LaunchedKeys).
+func TestTickConflictAndAddressReviewBothLaunchSameTick(t *testing.T) {
+	var calls [][]string
+	withCommands(t, []string{
+		conflictingOpenPR("abc"),
+		`[{"bucket":"pass","name":"test","state":"SUCCESS"}]`,
+		`[{"id":7,"updated_at":"2026-01-02T00:00:00Z","user":{"login":"reviewer"}}]`,
+		`[]`,
+	}, &calls)
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900, LastHeadSHA: "abc", LaunchSession: "work"}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatal(err)
+	}
+	if n := countWorkflowLaunches(calls, "babysit-attention"); n != 1 {
+		t.Fatalf("babysit-attention launches = %d, want exactly 1: %#v", n, calls)
+	}
+	if n := countAddressReviewLaunches(calls); n != 1 {
+		t.Fatalf("address-review launches = %d, want exactly 1: the conflict escalation must not suppress address-review dispatch (Q&A 2): %#v", n, calls)
+	}
+}
+
+// TestTickConflictLaunchFailureRecordsWorkflowLaunchFailedAndRetries is
+// #995's Implementation Order step 6 (mirroring
+// TestTickReopenLaunchFailureRetriesNextTickAndPreservesReopenState's
+// pattern): a failed babysit-attention launch on the conflict path must
+// return the error (not errNeedsInput -- the conflict path must never pause
+// the supervisor, per the ticket's Decision), record
+// AutomergeReason == reasonWorkflowLaunchFailed, leave ConflictNotifiedSHA
+// unset, and let the very next tick retry -- exactly once, succeeding this
+// time.
+func TestTickConflictLaunchFailureRecordsWorkflowLaunchFailedAndRetries(t *testing.T) {
+	withFleetAutomergeEnabled(t, true)
+	pr := conflictingOpenPR("abc")
+	responses := []string{pr, `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`}
+	var calls [][]string
+	originalCommand := command
+	originalExecGh := execGh
+	i := 0
+	execGh = func(args ...string) (string, string, error) {
+		calls = append(calls, append([]string{"gh"}, args...))
+		if i >= len(responses) {
+			return "", "", fmt.Errorf("unexpected command: %s", strings.Join(args, " "))
+		}
+		out := responses[i]
+		i++
+		return out, "", nil
+	}
+	command = func(name string, args ...string) ([]byte, error) {
+		calls = append(calls, append([]string{name}, args...))
+		return []byte("boom"), errors.New("exit status 1")
+	}
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() {
+		command = originalCommand
+		execGh = originalExecGh
+		tmuxHasSession = originalTmuxHasSession
+	})
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 300, CurrentDelaySeconds: 900, LastHeadSHA: "abc", LaunchSession: "work"}
+	_, _, err := tick(&s)
+	if err == nil {
+		t.Fatal("tick: err = nil, want the conflict-path launch failure to surface as a tick error")
+	}
+	if errors.Is(err, errNeedsInput) {
+		t.Fatal("tick err wraps errNeedsInput, want a plain launch error: the conflict path must never pause the supervisor (Decision)")
+	}
+	if s.ConflictNotifiedSHA != "" {
+		t.Fatalf("ConflictNotifiedSHA = %q, want empty: a failed launch must never record the dedup marker, so the next tick retries", s.ConflictNotifiedSHA)
+	}
+	if s.AutomergeReason != reasonWorkflowLaunchFailed {
+		t.Fatalf("AutomergeReason = %q, want %q", s.AutomergeReason, reasonWorkflowLaunchFailed)
+	}
+
+	// Next tick: command() now succeeds, so the retry launches successfully.
+	var calls2 [][]string
+	withCommands(t, []string{pr, `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`, `[]`, `[]`}, &calls2)
+	if _, _, err := tick(&s); err != nil {
+		t.Fatal(err)
+	}
+	if n := countWorkflowLaunches(calls2, "babysit-attention"); n != 1 {
+		t.Fatalf("retry tick: babysit-attention launches = %d, want exactly 1: %#v", n, calls2)
+	}
+	if s.ConflictNotifiedSHA != "abc" {
+		t.Fatalf("ConflictNotifiedSHA = %q, want %q after a successful retry launch", s.ConflictNotifiedSHA, "abc")
+	}
+}

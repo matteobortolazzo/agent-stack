@@ -136,6 +136,19 @@ type State struct {
 	// since-superseded commit count toward the grace.
 	ChecksAbsentHeadSHA string `json:"checksAbsentHeadSha,omitempty"`
 
+	// ConflictNotifiedSHA (#995) is the head commit SHA the conflict
+	// escalation last opened a babysit-attention window for -- purely
+	// additive `omitempty`, no stateSchemaVersion bump, mirroring
+	// ChecksAbsentSince/ChecksAbsentHeadSHA above: its zero value already
+	// means "never notified", so no migration is needed for a state file
+	// written before this field existed. Dedicated rather than reusing
+	// LastHeadSHA (which is CI-repair edge-detection state, advanced and
+	// reset by the failing-checks branch for unrelated reasons) -- see the
+	// ticket's rejected-alternative writeup. Cleared once a later tick
+	// observes the conflict has resolved, releasing the Status ==
+	// "needs-input" hold (#1079's bounded-hold convention).
+	ConflictNotifiedSHA string `json:"conflictNotifiedHeadSha,omitempty"`
+
 	// Automerge fields (#824). The supervisor's detached mode sets
 	// cmd.Stdout = nil, so the automerge decision log line only reaches a
 	// terminal under --once -- these persist the decision into the state
@@ -174,6 +187,7 @@ type prView struct {
 	MergedAt                *time.Time             `json:"mergedAt"`
 	ClosingIssuesReferences []struct{ Number int } `json:"closingIssuesReferences"`
 	Mergeable               string                 `json:"mergeable"`
+	MergeStateStatus        string                 `json:"mergeStateStatus"`
 	IsDraft                 bool                   `json:"isDraft"`
 	ChangedFiles            int                    `json:"changedFiles"`
 	Additions               int                    `json:"additions"`
@@ -184,7 +198,25 @@ type prView struct {
 // prViewFields is the --json field set every `gh pr view` call in this
 // package requests -- shared by tick's own fetch and merge.go's post-merge
 // verification refetch so both decode the identical prView shape.
-const prViewFields = "number,title,state,headRefName,headRefOid,mergedAt,closingIssuesReferences,url,baseRefName,mergeable,isDraft,changedFiles,additions,deletions,files"
+const prViewFields = "number,title,state,headRefName,headRefOid,mergedAt,closingIssuesReferences,url,baseRefName,mergeable,mergeStateStatus,isDraft,changedFiles,additions,deletions,files"
+
+// prConflicting is the pure, fail-safe OR predicate #995's escalation branch
+// gates on: MergeStateStatus == "DIRTY" is authoritative on its own,
+// regardless of Mergeable; Mergeable == "CONFLICTING" only falls back to
+// conflicting when MergeStateStatus is empty or "UNKNOWN" -- a narrow
+// fail-safe, per watch/AGENTS.md's rule against broadening a match-miss into
+// a silent catch-all. Any other non-empty, recognized MergeStateStatus (e.g.
+// "BLOCKED", "BEHIND") is authoritative and NOT conflicting, even paired with
+// Mergeable == "CONFLICTING".
+func prConflicting(pr prView) bool {
+	if pr.MergeStateStatus == "DIRTY" {
+		return true
+	}
+	if pr.Mergeable == "CONFLICTING" && (pr.MergeStateStatus == "" || pr.MergeStateStatus == "UNKNOWN") {
+		return true
+	}
+	return false
+}
 
 type check struct{ Bucket, Name, State string }
 type comment struct {
@@ -580,6 +612,11 @@ func tick(s *State) (bool, time.Duration, error) {
 		clearChecksClock(s)
 	}
 	actionable := s.CIStatus == ciStatusPending || (s.CIStatus == ciStatusFailing && s.RepairPending)
+	// conflicting (#995) is computed once, up front, so the failing-checks
+	// branch below can gate its two existing launches on it (Decision:
+	// conflict wins over CI repair/retry-cap in the same tick) before the
+	// conflict escalation block itself runs, further down.
+	conflicting := prConflicting(pr)
 	var failing []string
 	for _, c := range checks {
 		if c.Bucket == "fail" {
@@ -588,32 +625,78 @@ func tick(s *State) (bool, time.Duration, error) {
 	}
 	if len(failing) > 0 && pr.HeadRefOID != s.LastHeadSHA {
 		if s.FixAttempts >= fixCap {
-			s.Status = "needs-input"
-			if err := launch(s, "babysit-attention", s.PR+" CI retry cap reached; decide whether to retry, pause, or stop"); err != nil {
-				// One-decision-per-tick (Decision 7, #854): without this, a
-				// failed workflow dispatch on an enabled automerge tick
-				// returned tick's error with no automerge decision recorded
-				// at all, leaving a stale decision from the previous tick
-				// displayed.
-				recordUpstreamReadFailure(s, reasonWorkflowLaunchFailed, err)
-				return false, 0, err
+			if !conflicting {
+				s.Status = "needs-input"
+				if err := launch(s, "babysit-attention", s.PR+" CI retry cap reached; decide whether to retry, pause, or stop"); err != nil {
+					// One-decision-per-tick (Decision 7, #854): without this, a
+					// failed workflow dispatch on an enabled automerge tick
+					// returned tick's error with no automerge decision recorded
+					// at all, leaving a stale decision from the previous tick
+					// displayed.
+					recordUpstreamReadFailure(s, reasonWorkflowLaunchFailed, err)
+					return false, 0, err
+				}
+				return false, 0, errNeedsInput
 			}
-			return false, 0, errNeedsInput
 		} else {
-			prompt := fmt.Sprintf("PR #%s (%s) has failing CI checks: %s. Diagnose, fix, test, commit, and push without force-pushing.", s.PR, pr.HeadRefName, strings.Join(failing, ", "))
-			if err := launch(s, "ci-repair", prompt); err != nil {
-				recordUpstreamReadFailure(s, reasonWorkflowLaunchFailed, err)
-				return false, 0, err
+			if !conflicting {
+				prompt := fmt.Sprintf("PR #%s (%s) has failing CI checks: %s. Diagnose, fix, test, commit, and push without force-pushing.", s.PR, pr.HeadRefName, strings.Join(failing, ", "))
+				if err := launch(s, "ci-repair", prompt); err != nil {
+					recordUpstreamReadFailure(s, reasonWorkflowLaunchFailed, err)
+					return false, 0, err
+				}
 			}
-			s.FixAttempts++
-			s.RepairPending = true
 		}
+		// Bookkeeping still advances literally even when the launches above
+		// were skipped for a conflicting PR (#995 Q&A 1): a conflicting,
+		// repeatedly-failing-CI PR still needs FixAttempts/RepairPending/
+		// LastHeadSHA to track this tick's observation, so a later push that
+		// both clears the conflict and still fails CI takes the normal
+		// ci-repair path with accurate bookkeeping.
+		s.FixAttempts++
+		s.RepairPending = true
 		s.LastHeadSHA = pr.HeadRefOID
 		actionable = true
 	} else if pr.HeadRefOID != s.LastHeadSHA {
 		s.FixAttempts = 0
 		s.RepairPending = false
 		s.LastHeadSHA = pr.HeadRefOID
+	}
+	// Merge-conflict observation and escalation (#995): independent of
+	// automerge.enabled, never returns errNeedsInput -- the loop keeps
+	// polling at IntervalSeconds so a pushed rebase self-heals the
+	// supervisor (ticket Decision). Falls through unconditionally so
+	// runAutomerge below still runs and can record its own refined
+	// reasonMergeConflicts/reasonBranchBehind decision.
+	if conflicting {
+		actionable = true
+		switch {
+		case pr.HeadRefOID == "":
+			// No key to dedup on -- opening a window every tick would be
+			// wrong (the Assumptions' degenerate case), so this only
+			// observes and prints, leaving ConflictNotifiedSHA untouched.
+			// reasonHeadSHAUnknown's own automerge hold already covers the
+			// same underlying condition.
+			fmt.Printf("PR #%s has merge conflicts but its head commit SHA is unknown; not opening a new babysit-attention window\n", s.PR)
+		case s.ConflictNotifiedSHA == pr.HeadRefOID:
+			fmt.Printf("PR #%s has merge conflicts at head commit %s; already notified, no new window opened\n", s.PR, pr.HeadRefOID)
+		default:
+			if err := launch(s, "babysit-attention", s.PR+" has merge conflicts with its base branch; decide whether to leave paused or stop babysitting"); err != nil {
+				recordUpstreamReadFailure(s, reasonWorkflowLaunchFailed, err)
+				return false, 0, err
+			}
+			s.ConflictNotifiedSHA = pr.HeadRefOID
+			s.Status = "needs-input"
+			fmt.Printf("PR #%s has merge conflicts at head commit %s; opened babysit-attention\n", s.PR, pr.HeadRefOID)
+		}
+	} else if s.ConflictNotifiedSHA != "" {
+		// Bounded-hold release (#1079): the conflict has cleared, so the
+		// Status == "needs-input" hold opened above must release, keyed on
+		// ConflictNotifiedSHA rather than Status itself -- a tick error can
+		// clobber Status to "retrying" in between, but this reset survives
+		// that (see the ticket's Risks section).
+		s.ConflictNotifiedSHA = ""
+		s.Status = "running"
 	}
 	// Fully paginated (#854): fetchPaged follows every page up to
 	// maxFeedbackPages, so a PR with more comments than one page no longer

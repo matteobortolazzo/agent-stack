@@ -1401,7 +1401,11 @@ distinguishable reason and is safe to retry once the rate has settled.
   moves back to pending and holds the merge under its own reason, distinct
   from ordinary pending feedback, since GitHub revoked a resolution babysit
   had already relied on.
-- The PR is not a draft and GitHub reports it `MERGEABLE`.
+- The PR is not a draft and GitHub reports it `MERGEABLE`. A conflicting PR
+  (`mergeStateStatus` `DIRTY`) holds under `PR has merge conflicts`; a branch
+  merely behind its base (`mergeStateStatus` `BEHIND`) holds under `PR branch is
+  behind base`; any other non-`MERGEABLE`/unrecognized state falls back to the
+  generic `PR not mergeable`.
 - The PR doesn't require a merge queue or other deferred-merge handling — a
   GraphQL probe (`isInMergeQueue`/`isMergeQueueEnabled`) checked as the final
   gate before mutation. Required, already-queued, or unreadable/unknown queue
@@ -1414,6 +1418,14 @@ distinguishable reason and is safe to retry once the rate has settled.
   `mergeMethod` stays readable for configuration compatibility, but only
   `squash` is ever executed: a `merge` or `rebase` policy holds under its own
   reason instead of being validated or executed.
+
+A conflicting PR (`mergeStateStatus` `DIRTY`) is escalated by `cenci babysit`
+independently of `automerge.enabled` — this fires whether or not automerge is on.
+The supervisor opens a `babysit-attention` window once per head SHA (a still-conflicting
+tick on the same SHA opens no second window), sets `Status = "needs-input"`, and keeps
+polling at its normal interval. It never mutates the branch or resolves the conflict
+itself; the hold clears on its own, resetting `Status` back to `"running"`, once a rebase
+is pushed and the next tick observes the PR mergeable again.
 
 A denied or held tick is logged once, e.g.:
 
