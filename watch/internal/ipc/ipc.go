@@ -44,6 +44,18 @@ const aliveDialTimeout = 200 * time.Millisecond
 // Full protection relies on the containing directory being 0700 and user-owned
 // (as provided by watch.SocketDir), which prevents other users from planting symlinks.
 func safeListen(socketPath string) (net.Listener, error) {
+	if socketPath == "" {
+		// net.Listen("unix", "") does NOT fail closed on Linux: the kernel
+		// autobinds into the abstract namespace (e.g. "@3855a"), producing a
+		// listener with no filesystem permissions at all, connectable by any
+		// local process in the same network namespace. That is worse than the
+		// unhardened-but-at-least-permission-checked /tmp fallback this empty
+		// path is meant to refuse in place of (#1147). os.Lstat("") also
+		// returns ENOENT, which os.IsNotExist treats as "nothing there yet",
+		// so without this guard the code below falls straight through to
+		// net.Listen. Reject explicitly instead.
+		return nil, errors.New("refusing to bind: empty socket path")
+	}
 	info, err := os.Lstat(socketPath)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -84,10 +96,22 @@ func DefaultPIDPath() string { return watch.DefaultPIDPath() }
 // daemon listens on for hook notifications. This write-side socket stays
 // internal; it is rebuilt from the shared watch.SocketDir and
 // watch.EventSocketBasename so the socket-dir resolution chain and its
-// sun_path length check live in exactly one place.
+// sun_path length check live in exactly one place. Falls back to
+// /tmp/cenci-events-<uid>.sock if the secure directory cannot be created for
+// a plain availability reason, mirroring the other Default*Path fallbacks in
+// pkg/watch/socket.go. If watch.SocketDir() fails because hardenDir
+// classified the failure as security-relevant
+// (watch.IsInsecureDirError(err) — a proven-hostile base or leaf), this
+// returns "" instead: the unhardened flat /tmp path would sit directly in
+// world-writable /tmp with no directory-level hardening, reopening the risk
+// the hard error was raised to prevent.
 func DefaultEventSocketPath() string {
 	dir, err := watch.SocketDir()
 	if err != nil {
+		if watch.IsInsecureDirError(err) {
+			log.Printf("warning: could not create secure socket dir: %v; refusing the unhardened /tmp fallback for the event socket", err)
+			return ""
+		}
 		log.Printf("warning: could not create secure socket dir: %v; using fallback event-socket path", err)
 		return filepath.Join(os.TempDir(), fmt.Sprintf("cenci-events-%d.sock", os.Getuid()))
 	}

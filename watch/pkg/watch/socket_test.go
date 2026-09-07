@@ -2,6 +2,7 @@ package watch
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -32,8 +33,13 @@ func captureLog(t *testing.T) *bytes.Buffer {
 // never from a live ResolveSocketDir()/SocketDir() call, so a test comparing
 // against it stays red until the resolver genuinely produces that path.
 type socketDirTier struct {
-	name      string
-	configure func(t *testing.T) (leaf string)
+	name string
+	// baseHardened reports whether this tier's base (filepath.Dir(leaf)) is
+	// routed through hardenDir like the leaf is. True for state/tmp (both
+	// create an intermediate directory cenci itself names); false for
+	// override (CENCI_SOCKET_DIR's parent is not a directory cenci manages).
+	baseHardened bool
+	configure    func(t *testing.T) (leaf string)
 }
 
 // socketDirTiers returns the three tier fixtures shared by every hardening
@@ -42,7 +48,8 @@ type socketDirTier struct {
 func socketDirTiers() []socketDirTier {
 	return []socketDirTier{
 		{
-			name: "override",
+			name:         "override",
+			baseHardened: false,
 			configure: func(t *testing.T) string {
 				t.Setenv("XDG_STATE_HOME", "") // irrelevant: override always wins outright
 				base := t.TempDir()
@@ -59,7 +66,8 @@ func socketDirTiers() []socketDirTier {
 			},
 		},
 		{
-			name: "state",
+			name:         "state",
+			baseHardened: true,
 			configure: func(t *testing.T) string {
 				t.Setenv("CENCI_SOCKET_DIR", "")
 				base := t.TempDir()
@@ -68,7 +76,8 @@ func socketDirTiers() []socketDirTier {
 			},
 		},
 		{
-			name: "tmp",
+			name:         "tmp",
+			baseHardened: true,
 			configure: func(t *testing.T) string {
 				t.Setenv("CENCI_SOCKET_DIR", "")
 				t.Setenv("XDG_STATE_HOME", "")
@@ -683,5 +692,554 @@ func TestSocketNames_ShareSocketDirParent(t *testing.T) {
 				t.Errorf("cenci.sock and cenci-events.sock must share a parent dir; got %q vs %q", filepath.Dir(broadcast), filepath.Dir(events))
 			}
 		})
+	}
+}
+
+// -- #1147: hardenDir sentinel classification --------------------------------
+
+// TestHardenDir_ClassifiesInsecureVsUncreatable directly exercises hardenDir
+// (in-package call, no resolver involved) to pin the errInsecureDir sentinel
+// classification per watch/docs/error-handling.md #412: errors.Is must be
+// true for each of the three security rejections (symlink, plain file, 0777
+// dir) and false — but still non-nil — for a plain creation (MkdirAll)
+// failure, so callers can tell "proven hostile" apart from "cannot
+// determine".
+func TestHardenDir_ClassifiesInsecureVsUncreatable(t *testing.T) {
+	t.Run("symlink", func(t *testing.T) {
+		base := t.TempDir()
+		target := t.TempDir()
+		dir := filepath.Join(base, "insecure")
+		if err := os.Symlink(target, dir); err != nil {
+			t.Fatalf("planting symlink %q -> %q: %v", dir, target, err)
+		}
+
+		err := hardenDir(dir)
+		if err == nil {
+			t.Fatal("hardenDir() error = nil, want error for a symlink")
+		}
+		if !errors.Is(err, errInsecureDir) {
+			t.Errorf("errors.Is(err, errInsecureDir) = false, want true for a symlink; err = %v", err)
+		}
+	})
+
+	t.Run("plain_file", func(t *testing.T) {
+		base := t.TempDir()
+		dir := filepath.Join(base, "insecure")
+		if err := os.WriteFile(dir, []byte("not a directory"), 0600); err != nil {
+			t.Fatalf("planting plain file at %q: %v", dir, err)
+		}
+
+		err := hardenDir(dir)
+		if err == nil {
+			t.Fatal("hardenDir() error = nil, want error for a plain file")
+		}
+		if !errors.Is(err, errInsecureDir) {
+			t.Errorf("errors.Is(err, errInsecureDir) = false, want true for a plain file; err = %v", err)
+		}
+	})
+
+	t.Run("writable_dir", func(t *testing.T) {
+		base := t.TempDir()
+		dir := filepath.Join(base, "insecure")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatalf("pre-creating %q: %v", dir, err)
+		}
+		if err := os.Chmod(dir, 0777); err != nil {
+			t.Fatalf("chmod %q: %v", dir, err)
+		}
+
+		err := hardenDir(dir)
+		if err == nil {
+			t.Fatal("hardenDir() error = nil, want error for a 0777 directory")
+		}
+		if !errors.Is(err, errInsecureDir) {
+			t.Errorf("errors.Is(err, errInsecureDir) = false, want true for a 0777 directory; err = %v", err)
+		}
+	})
+
+	t.Run("uncreatable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root bypasses Unix directory permission checks; cannot simulate an uncreatable directory")
+		}
+		parent := t.TempDir()
+		if err := os.Chmod(parent, 0500); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(parent, 0700) })
+		dir := filepath.Join(parent, "unusable")
+
+		err := hardenDir(dir)
+		if err == nil {
+			t.Fatal("hardenDir() error = nil, want error for an uncreatable directory")
+		}
+		if errors.Is(err, errInsecureDir) {
+			t.Errorf("errors.Is(err, errInsecureDir) = true, want false for an MkdirAll failure (this is availability, not security); err = %v", err)
+		}
+	})
+}
+
+// TestHardenDir_RejectsForeignOwnedDirectory covers #1147 Fix 2: a
+// pre-existing directory at an otherwise-acceptable permission (0755, so
+// perm&0022==0 and the writable check alone would pass) but owned by a
+// different uid must still be hard-rejected as errInsecureDir. This mirrors
+// the local-attacker scenario of pre-creating a predictable base (e.g.
+// /tmp/cenci-<uid>) they own before the victim ever runs cenci: without an
+// ownership check, the victim's own MkdirAll on the leaf inside it fails
+// with a plain (unclassified) EACCES, which callers would otherwise treat
+// as a mere availability failure and fall back to the unhardened flat /tmp
+// path.
+//
+// Constructing a genuinely foreign-owned directory needs root or a second
+// real system user, so this stubs dirOwnerUID -- the same seam pattern
+// internal/daemon/processctl.go's pidFileOwner uses for
+// TestReadPIDFile_RefusesForeignOwnedFile -- rather than requiring a second
+// real uid. Verified to behave the same under root: the stub changes what
+// hardenDir treats as "the expected owner", not the directory's actual
+// (real) owning uid, so the mismatch is provable regardless of Geteuid().
+func TestHardenDir_RejectsForeignOwnedDirectory(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "insecure")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("pre-creating %q: %v", dir, err)
+	}
+	if err := os.Chmod(dir, 0755); err != nil {
+		t.Fatalf("chmod %q: %v", dir, err)
+	}
+
+	restore := dirOwnerUID
+	dirOwnerUID = func() int { return os.Getuid() + 1 }
+	t.Cleanup(func() { dirOwnerUID = restore })
+
+	err := hardenDir(dir)
+	if err == nil {
+		t.Fatal("hardenDir() error = nil, want error for a foreign-owned directory")
+	}
+	if !errors.Is(err, errInsecureDir) {
+		t.Errorf("errors.Is(err, errInsecureDir) = false, want true for a foreign-owned directory; err = %v", err)
+	}
+	if !strings.Contains(err.Error(), "not owned") {
+		t.Errorf("error = %q, want it to mention %q", err.Error(), "not owned")
+	}
+}
+
+// -- #1147: base hardening for the state and tmp tiers -----------------------
+
+// TestSocketDir_RejectsSymlinkAtBase covers a symlink planted at the tier's
+// *base* (filepath.Dir(leaf): /tmp/cenci-<uid> or $XDG_STATE_HOME/cenci) for
+// the two hardened tiers, mirroring TestSocketDir_RejectsSymlinkAtLeaf: the
+// resolver must refuse to follow the symlink and must leave it untouched.
+func TestSocketDir_RejectsSymlinkAtBase(t *testing.T) {
+	for _, tier := range socketDirTiers() {
+		if !tier.baseHardened {
+			continue
+		}
+		t.Run(tier.name, func(t *testing.T) {
+			leaf := tier.configure(t)
+			base := filepath.Dir(leaf)
+			ensureParentDir(t, base)
+
+			target := t.TempDir()
+			if err := os.Symlink(target, base); err != nil {
+				t.Fatalf("planting symlink %q -> %q: %v", base, target, err)
+			}
+
+			_, err := ResolveSocketDir()
+			if err == nil {
+				t.Fatalf("ResolveSocketDir() error = nil, want error when the base is a symlink")
+			}
+			if !strings.Contains(err.Error(), "symlink") {
+				t.Errorf("error = %q, want it to mention %q", err.Error(), "symlink")
+			}
+
+			linkInfo, lerr := os.Lstat(base)
+			if lerr != nil {
+				t.Fatalf("Lstat(%q): %v", base, lerr)
+			}
+			if linkInfo.Mode()&os.ModeSymlink == 0 {
+				t.Fatalf("expected %q to still be a symlink, got mode %v", base, linkInfo.Mode())
+			}
+			gotTarget, rerr := os.Readlink(base)
+			if rerr != nil {
+				t.Fatalf("Readlink(%q): %v", base, rerr)
+			}
+			if gotTarget != target {
+				t.Errorf("symlink target changed: got %q, want %q", gotTarget, target)
+			}
+		})
+	}
+}
+
+// TestSocketDir_RejectsPlainFileAtBase covers a plain file planted at the
+// tier's base for the two hardened tiers.
+func TestSocketDir_RejectsPlainFileAtBase(t *testing.T) {
+	for _, tier := range socketDirTiers() {
+		if !tier.baseHardened {
+			continue
+		}
+		t.Run(tier.name, func(t *testing.T) {
+			leaf := tier.configure(t)
+			base := filepath.Dir(leaf)
+			ensureParentDir(t, base)
+
+			if err := os.WriteFile(base, []byte("not a directory"), 0600); err != nil {
+				t.Fatalf("planting plain file at %q: %v", base, err)
+			}
+
+			_, err := ResolveSocketDir()
+			if err == nil {
+				t.Fatalf("ResolveSocketDir() error = nil, want error when the base is a plain file")
+			}
+			if !strings.Contains(err.Error(), "not a directory") {
+				t.Errorf("error = %q, want it to mention %q", err.Error(), "not a directory")
+			}
+		})
+	}
+}
+
+// TestSocketDir_RejectsWritableBase covers a group/other-writable (0777)
+// pre-existing base for the two hardened tiers: this must hard-error, not
+// merely warn, and the removal of the old unconditional os.Chmod(base, 0700)
+// on the tmp tier must not silently repair it.
+func TestSocketDir_RejectsWritableBase(t *testing.T) {
+	for _, tier := range socketDirTiers() {
+		if !tier.baseHardened {
+			continue
+		}
+		t.Run(tier.name, func(t *testing.T) {
+			leaf := tier.configure(t)
+			base := filepath.Dir(leaf)
+			ensureParentDir(t, base)
+
+			if err := os.MkdirAll(base, 0700); err != nil {
+				t.Fatalf("pre-creating base %q: %v", base, err)
+			}
+			// Chmod bypasses umask, ensuring the base is actually
+			// group/other writable regardless of the process umask.
+			if err := os.Chmod(base, 0777); err != nil {
+				t.Fatalf("chmod %q: %v", base, err)
+			}
+
+			_, err := ResolveSocketDir()
+			if err == nil {
+				t.Fatalf("ResolveSocketDir() error = nil, want error when the base is group/other writable")
+			}
+			lower := strings.ToLower(err.Error())
+			if !strings.Contains(lower, "writable") && !strings.Contains(lower, "insecure permissions") {
+				t.Errorf("error = %q, want it to mention %q or %q", err.Error(), "writable", "insecure permissions")
+			}
+
+			info, statErr := os.Stat(base)
+			if statErr != nil {
+				t.Fatalf("stat(%q): %v", base, statErr)
+			}
+			if perm := info.Mode().Perm(); perm != 0777 {
+				t.Errorf("base permissions changed to %04o, want unchanged 0777 (no chmod fight)", perm)
+			}
+		})
+	}
+}
+
+// TestSocketDir_WarnsOnLooseBasePermissionsWithoutChmod covers a pre-existing
+// base at 0755 for the two hardened tiers: resolution must still succeed (no
+// chmod fight with an already-mounted dir) but must log a non-fatal warning,
+// and the base must be left at 0755 — this is the AC #3 replacement for the
+// old unconditional os.Chmod(base, 0700) on the tmp tier.
+func TestSocketDir_WarnsOnLooseBasePermissionsWithoutChmod(t *testing.T) {
+	for _, tier := range socketDirTiers() {
+		if !tier.baseHardened {
+			continue
+		}
+		t.Run(tier.name, func(t *testing.T) {
+			leaf := tier.configure(t)
+			base := filepath.Dir(leaf)
+			ensureParentDir(t, base)
+
+			if err := os.MkdirAll(base, 0700); err != nil {
+				t.Fatalf("pre-creating base %q: %v", base, err)
+			}
+			if err := os.Chmod(base, 0755); err != nil {
+				t.Fatalf("chmod %q: %v", base, err)
+			}
+
+			logBuf := captureLog(t)
+			res, err := ResolveSocketDir()
+			if err != nil {
+				t.Fatalf("ResolveSocketDir() error: %v", err)
+			}
+			if res.Dir != leaf {
+				t.Errorf("Dir = %q, want %q", res.Dir, leaf)
+			}
+			if !strings.Contains(strings.ToLower(logBuf.String()), "warning") {
+				t.Errorf("expected a warning to be logged for loose permissions on %q, got log output: %q", base, logBuf.String())
+			}
+
+			info, statErr := os.Stat(base)
+			if statErr != nil {
+				t.Fatalf("stat(%q): %v", base, statErr)
+			}
+			if perm := info.Mode().Perm(); perm != 0755 {
+				t.Errorf("base permissions changed to %04o, want unchanged 0755 (no chmod fight)", perm)
+			}
+		})
+	}
+}
+
+// TestSocketDir_FreshBaseIsCreated0700 covers the counter-case: a base that
+// does not exist yet must still be created at 0700, for the two hardened
+// tiers — proving the removal of the tmp tier's old unconditional
+// os.Chmod(base, 0700) doesn't regress the fresh-creation case.
+func TestSocketDir_FreshBaseIsCreated0700(t *testing.T) {
+	for _, tier := range socketDirTiers() {
+		if !tier.baseHardened {
+			continue
+		}
+		t.Run(tier.name, func(t *testing.T) {
+			leaf := tier.configure(t)
+			base := filepath.Dir(leaf)
+
+			res, err := ResolveSocketDir()
+			if err != nil {
+				t.Fatalf("ResolveSocketDir() error: %v", err)
+			}
+			if res.Dir != leaf {
+				t.Errorf("Dir = %q, want %q", res.Dir, leaf)
+			}
+
+			info, err := os.Stat(base)
+			if err != nil {
+				t.Fatalf("stat(%q): %v", base, err)
+			}
+			if !info.IsDir() {
+				t.Fatalf("%q is not a directory", base)
+			}
+			if perm := info.Mode().Perm(); perm != 0700 {
+				t.Errorf("base permissions = %04o, want 0700", perm)
+			}
+		})
+	}
+}
+
+// -- #1147: an insecure state root hard-errors with no fall-through ---------
+
+// TestResolveSocketDir_InsecureStateRoot_HardErrorsWithNoFallThrough covers
+// the state tier's new two-class split at the *base* ($XDG_STATE_HOME/cenci):
+// a symlink, a plain file, or a group/other-writable (0777) state root must
+// hard-error the whole resolution instead of falling through to the tmp
+// tier, mirroring TestResolveSocketDir_OverrideUnusable_HardErrorsWithNoFallThrough.
+// TMPDIR is isolated per watch/docs/test-isolation.md so a real fall-through
+// would be observable rather than accidentally landing on a developer's
+// ambient /tmp/cenci-<uid>.
+func TestResolveSocketDir_InsecureStateRoot_HardErrorsWithNoFallThrough(t *testing.T) {
+	// shortStateBase returns a fresh directory suitable for use as
+	// $XDG_STATE_HOME in these subtests. Unlike t.TempDir(), it does not
+	// embed this test's own (long) name into the path: that name, run
+	// through the sun_path length check on <stateBase>/cenci/run, already
+	// exceeds sunPathMax before hardenDir(stateRoot) ever runs -- a fixture
+	// hazard unrelated to the security behavior under test, mirroring the
+	// precaution socketDirTiers()'s "override" fixture documents for the
+	// same reason.
+	shortStateBase := func(t *testing.T) string {
+		t.Helper()
+		dir, err := os.MkdirTemp("", "state")
+		if err != nil {
+			t.Fatalf("MkdirTemp: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		return dir
+	}
+
+	setupTier3 := func(t *testing.T) string {
+		t.Helper()
+		tmpRoot := t.TempDir()
+		t.Setenv("TMPDIR", tmpRoot)
+		return filepath.Join(tmpRoot, fmt.Sprintf("cenci-%d", os.Getuid()), "cenci")
+	}
+
+	assertHardError := func(t *testing.T, wantSubstr, stateLeaf, tier3 string) {
+		t.Helper()
+		res, err := ResolveSocketDir()
+		if err == nil {
+			t.Fatalf("ResolveSocketDir() error = nil, want a hard error naming %q", wantSubstr)
+		}
+		lower := strings.ToLower(err.Error())
+		if !strings.Contains(lower, strings.ToLower(wantSubstr)) {
+			t.Errorf("error = %q, want it to mention %q", err.Error(), wantSubstr)
+		}
+		if res.Dir == stateLeaf {
+			t.Errorf("resolved to the state-tier leaf %q despite a hard error", stateLeaf)
+		}
+		if res.Dir == tier3 {
+			t.Errorf("silently fell through to the tier-3 path %q instead of hard-erroring", tier3)
+		}
+	}
+
+	t.Run("symlink", func(t *testing.T) {
+		t.Setenv("CENCI_SOCKET_DIR", "")
+		stateBase := shortStateBase(t)
+		t.Setenv("XDG_STATE_HOME", stateBase)
+		stateRoot := filepath.Join(stateBase, "cenci")
+		stateLeaf := filepath.Join(stateRoot, "run")
+		tier3 := setupTier3(t)
+
+		target := t.TempDir()
+		if err := os.Symlink(target, stateRoot); err != nil {
+			t.Fatalf("planting symlink %q -> %q: %v", stateRoot, target, err)
+		}
+
+		assertHardError(t, "symlink", stateLeaf, tier3)
+	})
+
+	t.Run("plain_file", func(t *testing.T) {
+		t.Setenv("CENCI_SOCKET_DIR", "")
+		stateBase := shortStateBase(t)
+		t.Setenv("XDG_STATE_HOME", stateBase)
+		stateRoot := filepath.Join(stateBase, "cenci")
+		stateLeaf := filepath.Join(stateRoot, "run")
+		tier3 := setupTier3(t)
+
+		if err := os.WriteFile(stateRoot, []byte("nope"), 0600); err != nil {
+			t.Fatalf("planting plain file at %q: %v", stateRoot, err)
+		}
+
+		assertHardError(t, "not a directory", stateLeaf, tier3)
+	})
+
+	t.Run("writable", func(t *testing.T) {
+		t.Setenv("CENCI_SOCKET_DIR", "")
+		stateBase := shortStateBase(t)
+		t.Setenv("XDG_STATE_HOME", stateBase)
+		stateRoot := filepath.Join(stateBase, "cenci")
+		stateLeaf := filepath.Join(stateRoot, "run")
+		tier3 := setupTier3(t)
+
+		if err := os.MkdirAll(stateRoot, 0700); err != nil {
+			t.Fatalf("pre-creating state root %q: %v", stateRoot, err)
+		}
+		// Chmod bypasses umask, ensuring the state root is actually
+		// group/other writable regardless of the process umask.
+		if err := os.Chmod(stateRoot, 0777); err != nil {
+			t.Fatalf("chmod %q: %v", stateRoot, err)
+		}
+
+		res, err := ResolveSocketDir()
+		if err == nil {
+			t.Fatalf("ResolveSocketDir() error = nil, want a hard error for a 0777 state root")
+		}
+		lower := strings.ToLower(err.Error())
+		if !strings.Contains(lower, "writable") && !strings.Contains(lower, "insecure permissions") {
+			t.Errorf("error = %q, want it to mention %q or %q", err.Error(), "writable", "insecure permissions")
+		}
+		if res.Dir == stateLeaf {
+			t.Errorf("resolved to the state-tier leaf %q despite a hard error", stateLeaf)
+		}
+		if res.Dir == tier3 {
+			t.Errorf("silently fell through to the tier-3 path %q instead of hard-erroring", tier3)
+		}
+	})
+}
+
+// -- #1147: fallback helpers fail closed on security-relevant errors --------
+
+// poisonTmpTierBase forces resolveTmpTier's own base
+// (/tmp/cenci-<uid>/cenci) to be the winning (and only reachable) tier by
+// disabling override and state, then plants a hostile object at that base so
+// hardenDir's failure is security-relevant (errors.Is(err, errInsecureDir)).
+func poisonTmpTierBase(t *testing.T) {
+	t.Helper()
+	t.Setenv("CENCI_SOCKET_DIR", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+	tmpRoot := t.TempDir()
+	t.Setenv("TMPDIR", tmpRoot)
+
+	base := filepath.Join(tmpRoot, fmt.Sprintf("cenci-%d", os.Getuid()))
+	if err := os.MkdirAll(base, 0700); err != nil {
+		t.Fatalf("pre-creating base %q: %v", base, err)
+	}
+	// Chmod bypasses umask, ensuring the base is actually group/other
+	// writable regardless of the process umask -- a proven-hostile base per
+	// hardenDir, so SocketDir() must return an error classified via
+	// errors.Is(err, errInsecureDir).
+	if err := os.Chmod(base, 0777); err != nil {
+		t.Fatalf("chmod %q: %v", base, err)
+	}
+}
+
+// TestDefaultSocketPath_PoisonedBase_ReturnsEmpty covers Fix 1's
+// security-relevant classification in defaultSocketPath: when SocketDir()
+// fails because the tmp tier's base was proven hostile (0777, group/other
+// writable), defaultSocketPath must return "" rather than falling back to
+// the unhardened flat /tmp/cenci-<uid>-<name>.sock path.
+func TestDefaultSocketPath_PoisonedBase_ReturnsEmpty(t *testing.T) {
+	poisonTmpTierBase(t)
+
+	got := DefaultSocketPath()
+	if got != "" {
+		t.Errorf("DefaultSocketPath() = %q, want \"\" (must not fall back to an unhardened /tmp path when the base is proven hostile)", got)
+	}
+}
+
+// TestDefaultPIDPath_PoisonedBase_ReturnsEmpty covers Fix 1's
+// security-relevant classification in DefaultPIDPath: when SocketDir() fails
+// because the tmp tier's base was proven hostile (0777, group/other
+// writable), DefaultPIDPath must return "" rather than falling back to the
+// unhardened flat /tmp/cenci-<uid>.pid path.
+func TestDefaultPIDPath_PoisonedBase_ReturnsEmpty(t *testing.T) {
+	poisonTmpTierBase(t)
+
+	got := DefaultPIDPath()
+	if got != "" {
+		t.Errorf("DefaultPIDPath() = %q, want \"\" (must not fall back to an unhardened /tmp path when the base is proven hostile)", got)
+	}
+}
+
+// -- #1147: fallback helpers keep the availability fallback unchanged -------
+
+// uncreatableTmpTierBase forces resolveTmpTier's base to be uncreatable (a
+// read-only parent directory), so SocketDir() fails for a plain availability
+// reason rather than a security-relevant one -- proving the fallback helpers'
+// existing /tmp flat-path behavior is untouched by Fix 1. Skips under root,
+// which bypasses Unix directory permission checks.
+func uncreatableTmpTierBase(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses Unix directory permission checks; cannot simulate an uncreatable directory")
+	}
+	t.Setenv("CENCI_SOCKET_DIR", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HOME", "")
+	tmpRoot := t.TempDir()
+	if err := os.Chmod(tmpRoot, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(tmpRoot, 0700) })
+	t.Setenv("TMPDIR", tmpRoot)
+}
+
+// TestDefaultSocketPath_UncreatableDir_StillFallsBackToFlatTmpPath is the
+// counter-case proving Fix 1 left the availability-failure path untouched: an
+// uncreatable (not proven-hostile) socket dir must still produce today's flat
+// /tmp/cenci-<name>-<uid>.sock fallback path, not "".
+func TestDefaultSocketPath_UncreatableDir_StillFallsBackToFlatTmpPath(t *testing.T) {
+	uncreatableTmpTierBase(t)
+
+	want := filepath.Join(os.TempDir(), fmt.Sprintf("cenci-%d.sock", os.Getuid()))
+	got := DefaultSocketPath()
+	if got != want {
+		t.Errorf("DefaultSocketPath() = %q, want %q (unchanged availability-failure fallback)", got, want)
+	}
+}
+
+// TestDefaultPIDPath_UncreatableDir_StillFallsBackToFlatTmpPath is the
+// counter-case proving Fix 1 left the availability-failure path untouched: an
+// uncreatable (not proven-hostile) socket dir must still produce today's flat
+// /tmp/cenci-<uid>.pid fallback path, not "".
+func TestDefaultPIDPath_UncreatableDir_StillFallsBackToFlatTmpPath(t *testing.T) {
+	uncreatableTmpTierBase(t)
+
+	want := filepath.Join(os.TempDir(), fmt.Sprintf("cenci-%d.pid", os.Getuid()))
+	got := DefaultPIDPath()
+	if got != want {
+		t.Errorf("DefaultPIDPath() = %q, want %q (unchanged availability-failure fallback)", got, want)
 	}
 }

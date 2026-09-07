@@ -1,11 +1,13 @@
 package watch
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 )
 
 // EventSocketBasename is the file name of the daemon's inbound event socket,
@@ -50,14 +52,42 @@ type SocketDirResolution struct {
 	Reason string
 }
 
-// hardenLeaf applies the same leaf-hardening shape to whichever tier's
-// candidate directory is being finalized: create fresh at 0700, reject a
-// symlink outright (never follow it), reject a non-directory, and warn
-// (without chmod) on a pre-existing directory with loose permissions. This
-// is the single home of that shape; every tier's resolution funnels through
-// it so the "per behavior per tier" hardening matrix is genuinely shared
-// code.
-func hardenLeaf(dir string) error {
+// errInsecureDir classifies a hardenDir rejection as security-relevant
+// (symlink, non-directory, or group/other-writable) rather than a plain
+// availability failure (e.g. an uncreatable directory). Callers use
+// errors.Is to decide whether a hardenDir failure must hard-error with no
+// fall-through or may be treated as "cannot determine, try somewhere else".
+var errInsecureDir = errors.New("insecure directory")
+
+// IsInsecureDirError reports whether err (or an error it wraps) indicates a
+// hardenDir security-relevant rejection (symlink, non-directory, or
+// group/other-writable) rather than an availability failure (e.g. an
+// uncreatable directory). Exported so internal/ipc's DefaultEventSocketPath
+// can apply the same fail-closed classification defaultSocketPath and
+// DefaultPIDPath already do, without duplicating the sentinel.
+func IsInsecureDirError(err error) bool {
+	return errors.Is(err, errInsecureDir)
+}
+
+// dirOwnerUID returns the uid that hardenDir requires a pre-existing socket
+// directory to be owned by (normally the current process's uid). A package
+// var, mirroring internal/daemon/processctl.go's pidFileOwner precedent, so
+// tests can stub it without needing a second real system user.
+var dirOwnerUID = os.Getuid
+
+// hardenDir applies the same hardening shape to whichever tier's candidate
+// directory is being finalized — an intermediate base (e.g.
+// /tmp/cenci-<uid> or $XDG_STATE_HOME/cenci) or a final leaf: create fresh
+// at 0700, reject a symlink outright (never follow it), reject a
+// non-directory, reject a pre-existing directory not owned by the current
+// user, and reject (or warn without chmod) on a pre-existing directory with
+// loose permissions. This is the single home of that shape; every tier's
+// resolution funnels through it so the "per behavior per tier" hardening
+// matrix is genuinely shared code. The four rejection branches (symlink,
+// non-directory, foreign-owned, group/other-writable) wrap errInsecureDir so
+// callers can classify the failure; an MkdirAll/Chmod/Lstat failure does
+// not.
+func hardenDir(dir string) error {
 	info, statErr := os.Lstat(dir)
 	switch {
 	case os.IsNotExist(statErr):
@@ -70,12 +100,25 @@ func hardenLeaf(dir string) error {
 	case statErr != nil:
 		return statErr
 	case info.Mode()&os.ModeSymlink != 0:
-		return fmt.Errorf("socket dir path %q is a symlink; refusing for security", dir)
+		return fmt.Errorf("socket dir path %q is a symlink; refusing for security: %w", dir, errInsecureDir)
 	case !info.IsDir():
-		return fmt.Errorf("socket dir path %q exists but is not a directory", dir)
+		return fmt.Errorf("socket dir path %q exists but is not a directory: %w", dir, errInsecureDir)
 	default:
+		// A local attacker can pre-create the base (e.g. a predictable
+		// /tmp/cenci-<uid> path under world-writable sticky /tmp) as a
+		// directory they own at a mode that passes the writable check below
+		// (e.g. 0755). Without an ownership check, the victim's own
+		// MkdirAll on the leaf inside it then fails with a plain EACCES —
+		// not classified as errInsecureDir — silently falling back to the
+		// unhardened flat /tmp path via ownership instead of permission
+		// bits. Reject up front instead, mirroring the uid check already
+		// applied to ReadPIDFile in internal/daemon/processctl.go.
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || int(st.Uid) != dirOwnerUID() {
+			return fmt.Errorf("socket dir %q is not owned by the current user: %w", dir, errInsecureDir)
+		}
 		if info.Mode().Perm()&0022 != 0 {
-			return fmt.Errorf("socket dir %q has insecure permissions %04o (group/other writable); refusing", dir, info.Mode().Perm())
+			return fmt.Errorf("socket dir %q has insecure permissions %04o (group/other writable); refusing: %w", dir, info.Mode().Perm(), errInsecureDir)
 		}
 		if info.Mode().Perm()&0077 != 0 {
 			log.Printf("warning: socket dir %q has loose permissions %04o (group/other access); expected 0700", dir, info.Mode().Perm())
@@ -93,7 +136,8 @@ func sunPathTooLong(dir string) (tooLong bool, computedLen int) {
 }
 
 // resolveSocketDir walks the three-tier chain and returns the winning
-// directory, already hardened at its leaf.
+// directory, already hardened — at both its base (where applicable) and its
+// leaf.
 //
 // Tier 1 ($CENCI_SOCKET_DIR, used verbatim — no appended segment): if set,
 // it must win or the whole resolution hard-errors. A relative path, an
@@ -101,14 +145,17 @@ func sunPathTooLong(dir string) (tooLong bool, computedLen int) {
 // all return immediately with a content-specific error — never a silent
 // fall-through to tier 2 or tier 3.
 //
-// Tier 2 ($XDG_STATE_HOME/cenci/run, default ~/.local/state/cenci/run): any
-// failure (unresolvable $HOME/$XDG_STATE_HOME, uncreatable state dir,
+// Tier 2 ($XDG_STATE_HOME/cenci/run, default ~/.local/state/cenci/run): a
+// state root proven hostile (symlink, non-directory, group/other-writable)
+// hard-errors the whole resolution with no fall-through. Any other failure
+// (unresolvable $HOME/$XDG_STATE_HOME, an uncreatable state dir, an
 // over-bound path) is logged with the specific reason and falls through to
 // tier 3.
 //
-// Tier 3 (/tmp/cenci-<uid>/cenci): the final, always-available fallback. Its
-// base (/tmp/cenci-<uid>) keeps the pre-existing MkdirAll(0700) +
-// unconditional Chmod(0700); only its leaf goes through hardenLeaf.
+// Tier 3 (/tmp/cenci-<uid>/cenci): the final, always-available fallback. Both
+// its base (/tmp/cenci-<uid>) and its leaf are hardened via hardenDir; any
+// failure here — security or availability — is a hard error, since there is
+// nowhere left to fall back to.
 func resolveSocketDir() (SocketDirResolution, error) {
 	if override := os.Getenv("CENCI_SOCKET_DIR"); override != "" {
 		if !filepath.IsAbs(override) {
@@ -117,7 +164,7 @@ func resolveSocketDir() (SocketDirResolution, error) {
 		if tooLong, n := sunPathTooLong(override); tooLong {
 			return SocketDirResolution{}, fmt.Errorf("CENCI_SOCKET_DIR %q is too long for a Unix socket path: %d bytes, want < %d", override, n, sunPathMax)
 		}
-		if err := hardenLeaf(override); err != nil {
+		if err := hardenDir(override); err != nil {
 			return SocketDirResolution{}, fmt.Errorf("CENCI_SOCKET_DIR %q is unusable: %w", override, err)
 		}
 		return SocketDirResolution{Dir: override, Tier: TierOverride}, nil
@@ -138,16 +185,20 @@ func resolveSocketDir() (SocketDirResolution, error) {
 	return SocketDirResolution{Dir: tmpDir, Tier: TierTmp, Reason: reason}, nil
 }
 
-// resolveStateTier attempts tier 2 ($XDG_STATE_HOME/cenci/run). A failure to
-// resolve or create the state root (unresolvable $HOME/$XDG_STATE_HOME, an
-// uncreatable state directory, or an over-bound path) is logged with its
-// specific reason (never memoized, so it fires on every call, matching
-// today's per-call loose-permission warning) and reported back as
-// dir=="", err==nil so the caller falls through to tier 3, carrying the
-// reason along for AC #6's daemon warning. A hardenLeaf failure at the leaf
-// itself (symlink, non-directory) is a hard error instead — once the state
-// root is genuinely reachable, an unexpected object sitting at the socket
-// leaf is a security-relevant condition, not a "try somewhere else" one.
+// resolveStateTier attempts tier 2 ($XDG_STATE_HOME/cenci/run). The state
+// root ($XDG_STATE_HOME/cenci) is hardened via hardenDir and its failure is
+// classified via errInsecureDir: a proven-hostile root (symlink,
+// non-directory, group/other-writable) hard-errors the whole resolution with
+// no fall-through, while an availability failure (unresolvable
+// $HOME/$XDG_STATE_HOME, an uncreatable state directory, or an over-bound
+// path) is logged with its specific reason (never memoized, so it fires on
+// every call, matching today's per-call loose-permission warning) and
+// reported back as dir=="", err==nil so the caller falls through to tier 3,
+// carrying the reason along for AC #6's daemon warning. A hardenDir failure
+// at the leaf itself is always a hard error, regardless of class — once the
+// state root is genuinely reachable, an unexpected object sitting at the
+// socket leaf is a security-relevant condition, not a "try somewhere else"
+// one.
 func resolveStateTier() (dir, reason string, err error) {
 	base := os.Getenv("XDG_STATE_HOME")
 	if base == "" {
@@ -169,33 +220,33 @@ func resolveStateTier() (dir, reason string, err error) {
 		return "", reason, nil
 	}
 
-	if mkErr := os.MkdirAll(stateRoot, 0700); mkErr != nil {
-		reason = fmt.Sprintf("could not create state directory %q: %v", stateRoot, mkErr)
+	if hErr := hardenDir(stateRoot); hErr != nil {
+		if errors.Is(hErr, errInsecureDir) {
+			return "", "", fmt.Errorf("state root %q is unusable: %w", stateRoot, hErr)
+		}
+		reason = fmt.Sprintf("could not create state directory %q: %v", stateRoot, hErr)
 		log.Printf("warning: %s; falling back to /tmp for the socket dir", reason)
 		return "", reason, nil
 	}
-	if hErr := hardenLeaf(leaf); hErr != nil {
+	if hErr := hardenDir(leaf); hErr != nil {
 		return "", "", fmt.Errorf("state-tier socket dir %q is unusable: %w", leaf, hErr)
 	}
 	return leaf, "", nil
 }
 
 // resolveTmpTier is the final, always-available fallback:
-// /tmp/cenci-<uid>/cenci. Its base keeps the pre-existing MkdirAll(0700) +
-// unconditional Chmod(0700); only the leaf goes through hardenLeaf. As the
-// last tier, any hardenLeaf failure here is necessarily a hard error — there
-// is nowhere left to fall back to.
+// /tmp/cenci-<uid>/cenci. Both the base (/tmp/cenci-<uid>) and the leaf go
+// through hardenDir. As the last tier, any hardenDir failure here —
+// security or availability — is necessarily a hard error; there is nowhere
+// left to fall back to.
 func resolveTmpTier() (string, error) {
 	base := filepath.Join(os.TempDir(), fmt.Sprintf("cenci-%d", os.Getuid()))
-	if err := os.MkdirAll(base, 0700); err != nil {
-		return "", fmt.Errorf("could not create tmp socket base %q: %w", base, err)
-	}
-	if err := os.Chmod(base, 0700); err != nil {
-		return "", fmt.Errorf("could not chmod tmp socket base %q: %w", base, err)
+	if err := hardenDir(base); err != nil {
+		return "", fmt.Errorf("tmp socket base %q is unusable: %w", base, err)
 	}
 
 	leaf := filepath.Join(base, "cenci")
-	if err := hardenLeaf(leaf); err != nil {
+	if err := hardenDir(leaf); err != nil {
 		return "", fmt.Errorf("tmp-tier socket dir %q is unusable: %w", leaf, err)
 	}
 	return leaf, nil
@@ -213,8 +264,9 @@ func ResolveSocketDir() (SocketDirResolution, error) {
 // SocketDir returns the resolved cenci socket directory: the winning tier of
 // $CENCI_SOCKET_DIR -> $XDG_STATE_HOME/cenci/run -> /tmp/cenci-<uid>/cenci,
 // with 0700 permissions enforced at creation and preserved thereafter. See
-// ResolveSocketDir for tier semantics and hardenLeaf for the leaf-hardening
-// shape (symlink rejection, non-directory rejection, loose-permission
+// ResolveSocketDir for tier semantics and hardenDir for the hardening shape
+// applied to both each tier's base and its leaf (symlink rejection,
+// non-directory rejection, group/other-writable rejection, loose-permission
 // warning without chmod on a pre-existing directory). Creation is idempotent
 // against a directory that already exists (e.g. a container bind-mount
 // pre-created by the host) — permissions are only forced on fresh creation
@@ -230,10 +282,20 @@ func SocketDir() (string, error) {
 
 // defaultSocketPath returns a socket path for the given name, nested under
 // SocketDir(), with a flat fallback under os.TempDir() if the directory
-// cannot be resolved/created.
+// cannot be resolved/created for a plain availability reason. If SocketDir()
+// fails because hardenDir classified the failure as security-relevant
+// (errors.Is(err, errInsecureDir) — a proven-hostile base or leaf), this
+// returns "" instead: falling through to the unhardened flat /tmp path would
+// reopen exactly the risk hardenDir's hard error was raised to prevent, since
+// that flat path sits directly in world-writable /tmp with no directory-level
+// hardening of its own.
 func defaultSocketPath(name string) string {
 	dir, err := SocketDir()
 	if err != nil {
+		if errors.Is(err, errInsecureDir) {
+			log.Printf("warning: socket dir is insecure: %v; refusing the unhardened /tmp fallback", err)
+			return ""
+		}
 		log.Printf("warning: could not create secure socket dir: %v; using fallback path", err)
 		return filepath.Join(os.TempDir(), fmt.Sprintf("%s-%d.sock", name, os.Getuid()))
 	}
@@ -248,13 +310,24 @@ func DefaultSocketPath() string { return defaultSocketPath("cenci") }
 // DefaultPIDPath returns the path of the daemon's PID file, nested under
 // SocketDir() alongside the broadcast/event sockets: <SocketDir>/cenci.pid.
 // Falls back to /tmp/cenci-<uid>.pid if the secure directory cannot be
-// created, mirroring the other Default*Path fallbacks in this file. The PID
-// file records the process ID of the running `cenci daemon start`
-// process so `daemon stop`/`daemon status` can locate it without scanning the
-// process table.
+// created for a plain availability reason, mirroring the other Default*Path
+// fallbacks in this file. If SocketDir() fails because hardenDir classified
+// the failure as security-relevant (errors.Is(err, errInsecureDir) — a
+// proven-hostile base or leaf), this returns "" instead: the unhardened flat
+// /tmp path would sit directly in world-writable /tmp with no directory-level
+// hardening, reopening the risk the hard error was raised to prevent. An
+// empty path passed to WritePIDFile/ReadPIDFile simply fails to open, so the
+// daemon runs without a PID file and `daemon stop`/`status` fall back to
+// their existing pgrepDaemon process-table scan. The PID file records the
+// process ID of the running `cenci daemon start` process so `daemon
+// stop`/`daemon status` can locate it without scanning the process table.
 func DefaultPIDPath() string {
 	dir, err := SocketDir()
 	if err != nil {
+		if errors.Is(err, errInsecureDir) {
+			log.Printf("warning: socket dir is insecure: %v; refusing the unhardened /tmp fallback pid path", err)
+			return ""
+		}
 		log.Printf("warning: could not create secure socket dir: %v; using fallback pid path", err)
 		return filepath.Join(os.TempDir(), fmt.Sprintf("cenci-%d.pid", os.Getuid()))
 	}
