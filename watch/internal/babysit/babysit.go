@@ -106,10 +106,11 @@ type State struct {
 	ClosingIssues []int `json:"closingIssues,omitempty"`
 	// CIStatus is the collapsed CI verdict for the supervised PR:
 	// ciStatusGreen, ciStatusFailing, ciStatusPending, ciStatusUnknown, or ""
-	// when no tick has completed yet. ciStatusUnknown covers two distinct
-	// causes -- a PR with zero checks configured, and a genuine gh pr
-	// view/gh pr checks read failure -- both bound by the same
-	// ChecksAbsentSince/ChecksAbsentHeadSHA settle clock (#924).
+	// when no tick has completed yet. ciStatusUnknown covers three distinct
+	// causes -- a PR with zero checks configured, a genuine gh pr view/gh pr
+	// checks read failure, and an unusable check bucket (cancel, an empty
+	// bucket string, or an unrecognized value, #1129) -- all bound by the
+	// same ChecksAbsentSince/ChecksAbsentHeadSHA settle clock (#924).
 	// ciStatusFailing, ciStatusPending, and ciStatusUnknown all hold a
 	// window open (#787, #923), but ciStatusUnknown's hold is now bounded to
 	// up to checksSettleGrace (10 minutes) rather than unbounded while the
@@ -998,11 +999,13 @@ func localRepoRoot() string {
 }
 
 // ciStatusUnknown records that either this tick's own gh pr view or gh pr
-// checks read genuinely failed (#923), or the PR legitimately has zero
-// checks configured at all (#924 D2) -- "not started" is not the same as
-// "passed", so a zero-checks PR must never read as green. Both causes hold
-// the close guard open, bound by the same ChecksAbsentSince/
-// ChecksAbsentHeadSHA settle clock (see checksSettleGrace below).
+// checks read genuinely failed (#923), the PR legitimately has zero checks
+// configured at all (#924 D2), or the check set's only non-pass/pending/fail
+// buckets are unusable -- cancel, an empty bucket string, or an unrecognized
+// value (#1129) -- "not started" is not the same as "passed", so none of
+// these must ever read as green. All three causes hold the close guard open,
+// bound by the same ChecksAbsentSince/ChecksAbsentHeadSHA settle clock (see
+// checksSettleGrace below).
 const ciStatusUnknown = "unknown"
 
 // ciStatusGreen, ciStatusFailing, and ciStatusPending are the guard's other
@@ -1070,31 +1073,34 @@ func settleGraceElapsed(s State) bool {
 	return elapsed >= checksSettleGrace
 }
 
-// ciStatus collapses a PR's check buckets into the guard's verdict:
-// ciStatusFailing if any check failed, else ciStatusPending if any check is
-// still pending, else ciStatusGreen. A PR with no checks at all reports
-// ciStatusUnknown, not green -- "not started" is not the same as "passed",
-// and a repo without CI configured yet must not read as a clean PR (#787,
-// #924 D2). ciStatusUnknown's hold is bounded by the settle clock
-// (checksSettleGrace), maintained by the caller via noteChecksUnknown/
-// clearChecksClock, not by ciStatus itself (a pure classifier).
+// ciStatus collapses a PR's check buckets into the guard's verdict, in
+// precedence order fail > pending > unknown > green (#1129 Decision): a
+// still-pending check is in-flight work and must outrank the settle-clock-
+// bounded unknown verdict, while a genuine failure keeps today's top
+// position. A PR with no checks at all, or whose only non-pass/pending/fail
+// buckets are unusable (cancel, an empty bucket string, or an unrecognized
+// value), reports ciStatusUnknown rather than green -- "not started" or
+// "unusable" is not the same as "passed" (#787, #924 D2, #1129's fail-open
+// close). skipping stays green-compatible, including a skipping-only,
+// zero-pass set, so `cenci close` behavior is unchanged on path-filtered
+// PRs. Counts come from the shared countBuckets tally; ciStatusUnknown's
+// hold is bounded by the settle clock (checksSettleGrace), maintained by the
+// caller via noteChecksUnknown/clearChecksClock, not by ciStatus itself (a
+// pure classifier).
 func ciStatus(checks []check) string {
-	if len(checks) == 0 {
+	t := countBuckets(checks)
+	switch {
+	case t.Total == 0:
 		return ciStatusUnknown
-	}
-	pending := false
-	for _, c := range checks {
-		switch c.Bucket {
-		case "fail":
-			return ciStatusFailing
-		case "pending":
-			pending = true
-		}
-	}
-	if pending {
+	case t.Fail > 0:
+		return ciStatusFailing
+	case t.Pending > 0:
 		return ciStatusPending
+	case t.Cancel > 0 || t.Empty > 0 || t.Unknown > 0:
+		return ciStatusUnknown
+	default:
+		return ciStatusGreen
 	}
-	return ciStatusGreen
 }
 
 // BlocksClose reports whether a live supervisor owns a PR that closes the

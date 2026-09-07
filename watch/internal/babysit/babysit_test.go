@@ -627,29 +627,93 @@ func TestTickRecordsClosingIssuesAndCIStatus(t *testing.T) {
 	}
 }
 
-// TestCancelBucketCIStillAllowsClose is a #787 regression pin (#854 Test
-// Strategy): the strict pass-only automerge classifier (automergeCIHold) is
-// deliberately a separate function from ciStatus(), which still feeds
-// BlocksClose -- a cancel-bucket check must not make ciStatus() report
-// "failing"/"pending" and wedge a tmux window open, even though the same
-// cancel bucket now holds automerge under its own reason.
-func TestCancelBucketCIStillAllowsClose(t *testing.T) {
+// TestCancelBucketCIStatusUnknownBoundedClose is a #1129 inversion of the old
+// #787/#854 regression pin (formerly TestCancelBucketCIStillAllowsClose): a
+// cancel-bucket-only CI result used to collapse to ciStatusGreen and allow an
+// immediate close -- that was ciStatus's fail-open (watch/docs/error-
+// handling.md's default-deny rule). It now reports ciStatusUnknown, starts
+// the ChecksAbsentSince/ChecksAbsentHeadSHA settle clock (bounded by
+// checksSettleGrace, watch/AGENTS.md's #1079 bounded-way-out rule), blocks
+// `cenci close` inside the grace, self-heals past it, and never launches
+// ci-repair or any other attention workflow (actionable stays false, AC 9) --
+// a cancelled check is not a failing one.
+func TestCancelBucketCIStatusUnknownBoundedClose(t *testing.T) {
 	stubProcessOwned(t, true)
 	dir := t.TempDir()
 	prWithIssue := `{"number":42,"title":"Change","state":"OPEN","headRefName":"feature","headRefOid":"abc","url":"https://example/pr/42","closingIssuesReferences":[{"number":782}]}`
 	var calls [][]string
 	withCommands(t, []string{prWithIssue, `[{"bucket":"cancel","name":"a"}]`, `[]`, `[]`}, &calls)
-	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60}
+	// PID must be set (mirroring TestBlocksCloseMatrix's live fixture) so
+	// supervisorLive's own s.PID > 0 gate is satisfied and stubProcessOwned's
+	// stubbed "live" answer is actually consulted -- tick() itself never
+	// touches PID, so this value survives unchanged into writeGuardState.
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60, PID: 4242}
+	before := time.Now().UTC()
 	if _, _, err := tick(&s); err != nil {
 		t.Fatal(err)
 	}
-	if s.CIStatus != "green" {
-		t.Fatalf("CIStatus = %q, want %q: ciStatus() must keep collapsing a cancel-only bucket to green (#787 unchanged), even though automergeCIHold now holds it under its own reason", s.CIStatus, "green")
+	if s.CIStatus != ciStatusUnknown {
+		t.Fatalf("CIStatus = %q, want %q (#1129): a cancel-only bucket must no longer collapse to green", s.CIStatus, ciStatusUnknown)
 	}
+	if s.ChecksAbsentSince.Before(before) {
+		t.Errorf("ChecksAbsentSince = %v, want a timestamp at/after %v: the settle clock must start on this first cancel-bucket observation", s.ChecksAbsentSince, before)
+	}
+	if _, found := launchCallArgs(calls, "ci-repair"); found {
+		t.Fatalf("ci-repair was launched for a cancel-only bucket, want no launch (AC 9): %#v", calls)
+	}
+	// actionable (a local var in tick, not persisted) is only observable via
+	// its backoff side effect: a cancel bucket triggers no other actionable
+	// path (no failing checks, no pending review keys, automerge disabled by
+	// default in tests), so a false actionable must double CurrentDelaySeconds
+	// rather than leave it pinned at IntervalSeconds.
+	if s.CurrentDelaySeconds != s.IntervalSeconds*2 {
+		t.Errorf("CurrentDelaySeconds = %d, want %d: actionable must stay false for a cancel-only bucket (AC 9), backing off instead of polling at interval", s.CurrentDelaySeconds, s.IntervalSeconds*2)
+	}
+
 	writeGuardState(t, dir, s)
 	blocks, _ := BlocksClose("782", "", dir)
-	if blocks {
-		t.Fatal("BlocksClose = true, want false: a cancel-bucket-only CI result must not hold the window open")
+	if !blocks {
+		t.Fatal("BlocksClose = false, want true: a fresh ciStatusUnknown verdict must still block inside the settle grace")
+	}
+
+	// Past the settle grace, the same verdict must self-heal and stop
+	// blocking -- the bounded-way-out half of the fix (#1079).
+	pastGrace := s
+	pastGrace.ChecksAbsentSince = time.Now().UTC().Add(-(checksSettleGrace + time.Minute))
+	writeGuardState(t, dir, pastGrace)
+	blocksPastGrace, _ := BlocksClose("782", "", dir)
+	if blocksPastGrace {
+		t.Fatal("BlocksClose = true, want false: a ciStatusUnknown verdict must stop blocking once checksSettleGrace has elapsed")
+	}
+}
+
+// TestCIStatusPrecedenceMatrix pins ciStatus's full precedence contract
+// (#1129 Decision): fail > pending > unknown > green. cancel/empty/
+// unrecognized buckets are folded into ciStatusUnknown -- closing the guard's
+// old fail-open -- but never outrank a genuine fail or pending, and
+// skipping stays green-compatible (including a skipping-only, zero-pass set)
+// so `cenci close` behavior on this repo's own path-filtered PRs is
+// unchanged.
+func TestCIStatusPrecedenceMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		checks []check
+		want   string
+	}{
+		{"pending plus cancel is pending: pending outranks unknown", []check{{Bucket: "pending"}, {Bucket: "cancel"}}, ciStatusPending},
+		{"fail plus cancel is failing: fail outranks unknown", []check{{Bucket: "fail"}, {Bucket: "cancel"}}, ciStatusFailing},
+		{"pass plus skipping is green (unchanged)", []check{{Bucket: "pass"}, {Bucket: "skipping"}}, ciStatusGreen},
+		{"skipping-only with zero pass is green (unchanged)", []check{{Bucket: "skipping"}}, ciStatusGreen},
+		{"empty-bucket-only is unknown (fail-open closed)", []check{{Bucket: ""}}, ciStatusUnknown},
+		{"unrecognized-value-only is unknown (fail-open closed)", []check{{Bucket: "neutral"}}, ciStatusUnknown},
+		{"cancel-only is unknown (fail-open closed, inverts old green)", []check{{Bucket: "cancel"}}, ciStatusUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ciStatus(tc.checks)
+			if got != tc.want {
+				t.Fatalf("ciStatus(%v) = %q, want %q", tc.checks, got, tc.want)
+			}
+		})
 	}
 }
 

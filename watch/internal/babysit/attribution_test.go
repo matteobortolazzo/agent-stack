@@ -97,6 +97,57 @@ func TestConfirmedMergePostsExactlyOneAttributionComment(t *testing.T) {
 	}
 }
 
+// TestConfirmedMergeAttributionBodyCarriesSkippedSuffix pins #1129 AC 11 on
+// the durable attribution record, not just the log line: a merge that went
+// green via the new "at least one pass, the rest skipping" rule must carry
+// the "(skipped=N)" diagnostic on the "ci" stage in the posted comment body
+// too, since the comment is rendered from the same conditionBracket as
+// logLine (mergeAttributionBody / attribution.go:83).
+func TestConfirmedMergeAttributionBodyCarriesSkippedSuffix(t *testing.T) {
+	withFleetAutomergeEnabled(t, true)
+	skippedChecks := `[{"bucket":"pass","name":"test","state":"SUCCESS"},{"bucket":"skipping","name":"a","state":"SKIPPED"},{"bucket":"skipping","name":"b","state":"SKIPPED"}]`
+	var calls [][]string
+	script := []scriptedCall{
+		{out: automergeEligiblePR()},
+		{out: skippedChecks},
+		{out: `[]`},
+		{out: `[]`},
+		{out: `{"labels":[{"name":"automerge:ok"}]}`},
+		{out: `{"automerge":{"maxChangedFiles":10,"maxDiffLines":500,"mergeMethod":"squash"}}`},
+		{out: `{"squash":true,"merge":false,"rebase":true}`},
+		{out: queueProbeResponse(false, false, "abc")},
+	}
+	script = append(script, automergeRecheckScript(
+		automergeEligiblePR(),
+		skippedChecks,
+		`[]`,
+		`[]`,
+		`{"labels":[{"name":"automerge:ok"}]}`,
+		`{"automerge":{"maxChangedFiles":10,"maxDiffLines":500,"mergeMethod":"squash"}}`,
+		queueProbeResponse(false, false, "abc"),
+	)...)
+	script = append(script,
+		scriptedCall{out: "Merged pull request #42 (o/r)"},
+		scriptedCall{out: `{"number":42,"title":"Change","state":"MERGED","headRefName":"feature","headRefOid":"abc","baseRefName":"main","mergeable":"MERGEABLE","isDraft":false,"changedFiles":1,"additions":5,"deletions":2,"files":[{"path":"watch/internal/babysit/x.go"}],"url":"https://example/pr/42","closingIssuesReferences":[{"number":9}]}`},
+		scriptedCall{out: "https://example/pr/42#issuecomment-1"},
+	)
+	withScriptedCommands(t, script, &calls)
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 900}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatal(err)
+	}
+
+	posted := attributionCommentCalls(calls)
+	if len(posted) != 1 {
+		t.Fatalf("gh pr comment calls = %d, want exactly 1 on a confirmed merge: %#v", len(posted), calls)
+	}
+	body := commentBody(t, posted[0])
+	if !strings.Contains(body, "ci=yes(skipped=2)") {
+		t.Fatalf("comment body must carry the skipped-count suffix on the ci stage: %q", body)
+	}
+}
+
 // allStagesPassed builds the all-green condition set a fully-eligible merge
 // produces, for asserting the rendered bracket.
 func allStagesPassed() []conditionResult {

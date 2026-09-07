@@ -63,3 +63,48 @@ func fetchChecks(pr, repo string) ([]check, error) {
 	}
 	return nil, wrapped
 }
+
+// bucketTally is a closed-set-enum tally of a check slice's buckets (#1129):
+// named counters, not a map[string]int, so both call sites (automergeCIHold
+// and ciStatus) stay compile-checked against the fixed bucket set per
+// watch/docs/go-gotchas.md's closed-set-enum discipline. Empty and Unknown
+// cover the malformed bucket string and any future/unrecognized bucket
+// value, respectively. Total is every check counted, regardless of bucket.
+type bucketTally struct {
+	Pass     int
+	Fail     int
+	Pending  int
+	Cancel   int
+	Skipping int
+	Empty    int
+	Unknown  int
+	Total    int
+}
+
+// countBuckets tallies checks' buckets into a bucketTally -- the single
+// shared counting helper both automergeCIHold and ciStatus draw their counts
+// from (#1129), so neither classifier's own precedence logic duplicates the
+// bucket-to-counter mapping.
+func countBuckets(checks []check) bucketTally {
+	var t bucketTally
+	for _, c := range checks {
+		switch c.Bucket {
+		case "pass":
+			t.Pass++
+		case "fail":
+			t.Fail++
+		case "pending":
+			t.Pending++
+		case "cancel":
+			t.Cancel++
+		case "skipping":
+			t.Skipping++
+		case "":
+			t.Empty++
+		default:
+			t.Unknown++
+		}
+		t.Total++
+	}
+	return t
+}

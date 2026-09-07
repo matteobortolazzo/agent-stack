@@ -1272,16 +1272,21 @@ Caveats on the babysit guard:
 - Every *state-file* read failure (no state directory, unreadable or corrupt
   file) fails *open*: the window closes. A machine that never runs
   `cenci babysit` behaves exactly as it did before. This is distinct from a
-  *live* supervisor recording CI status `unknown` in the state file — either
-  because the PR has zero checks configured yet, or because the supervisor's
-  own `gh pr view`/`gh pr checks` call is genuinely failing (not a benign
-  "checks still pending" or "no checks reported" shape). Both causes hold the
-  window closed for up to `checksSettleGrace` (10 minutes) from when `unknown`
-  was first observed for the current commit — not unbounded — after which the
-  guard stops blocking even if the supervisor's polls keep failing, so a lost
-  network connection or bad `gh` auth cannot wedge the window open forever
-  with no self-heal. Use `cenci close --force` to close anyway, or `cenci
-  babysit stop <pr>` to stop the supervisor sooner.
+  *live* supervisor recording CI status `unknown` in the state file — because
+  the PR has zero checks configured yet, because the supervisor's own
+  `gh pr view`/`gh pr checks` call is genuinely failing (not a benign "checks
+  still pending" or "no checks reported" shape), or because the checks that do
+  exist are all in an unusable bucket (`cancel`, an empty bucket string, or a
+  value the guard doesn't recognize). All three causes hold the window closed
+  for up to `checksSettleGrace` (10 minutes) from when `unknown` was first
+  observed for the current commit — not unbounded — after which the guard
+  stops blocking even if the supervisor's polls keep failing, so a lost
+  network connection, bad `gh` auth, or a stray unrecognized check bucket
+  cannot wedge the window open forever with no self-heal. The unusable-bucket
+  cause is new behavior: such a PR used to read as green and close
+  immediately, and now instead blocks for up to that same 10-minute window.
+  Use `cenci close --force` to close anyway, or `cenci babysit stop <pr>` to
+  stop the supervisor sooner.
 - `cenci close` scopes the match to the current checkout's repo root, but the
   daemon's deferred re-check has no repo context (a registered pending-close
   carries none) and matches on ticket number alone. Two repos babysitting PRs
@@ -1366,10 +1371,13 @@ distinguishable reason and is safe to retry once the rate has settled.
   clears feedback by itself. An inline comment thread clears only when GitHub
   reports it `isResolved`; a `CHANGES_REQUESTED` review clears only when it's
   `DISMISSED` or the reviewer's latest effective review is `APPROVED`. "Green"
-  is pass-only and strict: at least one check must exist, and every check's
-  bucket must be exactly `pass` — `cancel`, `skipping`, an empty bucket string
-  (malformed), and any future/unrecognized bucket value each hold under their
-  own distinct reason rather than being folded into a generic "not green".
+  requires at least one check to exist and be `pass`; every other check may be
+  `pass` or `skipping` — a paths-filtered monorepo's unaffected-project checks
+  (routinely `skipping`) no longer hold automerge on their own. `fail`,
+  `pending`, `cancel`, an empty bucket string (malformed), and any
+  future/unrecognized bucket value each still hold under their own distinct
+  reason rather than being folded into a generic "not green"; an all-`skipping`
+  set with zero `pass` holds too, under its own distinct reason.
 - Comment and review detection reads are fully paginated, with an explicit
   completeness signal — pagination stopping short (page cap hit, mid-read
   failure) never gets silently treated as a complete read. Detection still
@@ -1415,9 +1423,13 @@ babysit: automerge PR #42 held: ticket lacks automerge:ok [enabled=yes label=no 
 
 The bracket renders every condition-chain stage in evaluation order: `yes` passed,
 `no` is the stage that failed, `-` was never reached because an earlier stage
-short-circuited. A trailing `class=<class>` appears when the hold stemmed from a `gh`
-failure. See [The autonomous loop](../docs/autonomous-loop.md#reading-a-decision) for
-a per-key legend.
+short-circuited. Once the `ci` stage is reached, a non-zero count of `skipping`
+checks renders as a suffix, e.g. `ci=yes(skipped=6)` or `ci=no(skipped=9)` —
+diagnostic only, it never changes the verdict; a zero count renders the plain
+`ci=yes`/`ci=no`, and an unreached `ci` stage still renders the plain `-`. A trailing
+`class=<class>` appears when the hold stemmed from a `gh` failure. See
+[The autonomous loop](../docs/autonomous-loop.md#reading-a-decision) for a per-key
+legend.
 
 When every condition passes, babysit merges with `gh pr merge --squash` (never
 `--delete-branch` — a PR worktree still references the branch) after confirming

@@ -544,17 +544,109 @@ func TestAutomergeCIHoldBucketMatrix(t *testing.T) {
 		{"any fail holds", []check{{Bucket: "pass"}, {Bucket: "fail"}}, reasonCICheckFailed},
 		{"any pending holds", []check{{Bucket: "pass"}, {Bucket: "pending"}}, reasonCICheckPending},
 		{"any cancel holds", []check{{Bucket: "pass"}, {Bucket: "cancel"}}, reasonCICheckCancelled},
-		{"any skipping holds", []check{{Bucket: "pass"}, {Bucket: "skipping"}}, reasonCICheckSkipped},
+		// #1129 AC 1: at least one pass plus any number of skipping is green
+		// -- paths-filtered monorepo checks must not hold automerge forever.
+		{"pass plus skipping is green (#1129 AC 1)", []check{{Bucket: "pass"}, {Bucket: "skipping"}}, ""},
+		{"multiple pass plus multiple skipping is green (#1129 AC 1)", []check{{Bucket: "pass"}, {Bucket: "pass"}, {Bucket: "skipping"}, {Bucket: "skipping"}, {Bucket: "skipping"}}, ""},
+		// #1129 AC 2: zero pass, only skipping, holds under its own distinct
+		// reason -- separate from reasonNoChecks (zero checks at all).
+		{"all skipping with zero pass holds under its own reason (#1129 AC 2)", []check{{Bucket: "skipping"}, {Bucket: "skipping"}}, reasonCIAllChecksSkipped},
+		{"single skipping with zero pass holds under its own reason (#1129 AC 2)", []check{{Bucket: "skipping"}}, reasonCIAllChecksSkipped},
 		{"empty-string bucket holds", []check{{Bucket: ""}}, reasonCIBucketEmpty},
 		{"unknown future bucket holds", []check{{Bucket: "neutral"}}, reasonCIBucketUnknown},
 		{"mixed: fail found before pending in appearance order", []check{{Bucket: "fail"}, {Bucket: "pending"}}, reasonCICheckFailed},
 		{"mixed: pending found before cancel in appearance order", []check{{Bucket: "pending"}, {Bucket: "cancel"}}, reasonCICheckPending},
-		{"mixed: skipping found before an unknown bucket in appearance order", []check{{Bucket: "skipping"}, {Bucket: "neutral"}}, reasonCICheckSkipped},
+		// #1129 AC 4: skipping no longer masks a genuinely non-pass bucket --
+		// this case flips from reasonCICheckSkipped (retired) to
+		// reasonCIBucketUnknown, since skipping is now treated like pass in
+		// the appearance-order loop and the unknown bucket is the first
+		// genuinely-holding one found.
+		{"skipping no longer masks an unknown bucket found after it (#1129 AC 4)", []check{{Bucket: "skipping"}, {Bucket: "neutral"}}, reasonCIBucketUnknown},
+		// #1129 AC 4: skipping-masks-nothing, one case per other distinct
+		// non-pass bucket, confirming skipping is transparent to every
+		// existing hold reason regardless of which side of it appears.
+		{"skipping does not mask a fail found after it (#1129 AC 4)", []check{{Bucket: "skipping"}, {Bucket: "fail"}}, reasonCICheckFailed},
+		{"skipping does not mask a pending found after it (#1129 AC 4)", []check{{Bucket: "skipping"}, {Bucket: "pending"}}, reasonCICheckPending},
+		{"skipping does not mask a cancel found after it (#1129 AC 4)", []check{{Bucket: "skipping"}, {Bucket: "cancel"}}, reasonCICheckCancelled},
+		{"skipping does not mask an empty bucket found after it (#1129 AC 4)", []check{{Bucket: "skipping"}, {Bucket: ""}}, reasonCIBucketEmpty},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := automergeCIHold(tc.checks)
 			if got != tc.want {
 				t.Fatalf("automergeCIHold(%v) = %q, want %q", tc.checks, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAutomergeDecisionConditionBracketSkippedSuffix pins the #1129 AC 11
+// diagnostic suffix: conditionBracket renders "(skipped=N)" on the "ci" key
+// only when the "ci" stage was actually reached (rendered symbol "yes" or
+// "no") AND SkippedChecks > 0. A zero SkippedChecks renders plain, and an
+// unreached "ci" stage (rendered "-") never grows the suffix regardless of
+// SkippedChecks -- byte-exact regression pin for the "-" case, since
+// automerge_test.go:618 (TestAutomergeDecisionLogLine), docs/autonomous-
+// loop.md, and watch/README.md's example brackets all depend on it staying
+// plain.
+func TestAutomergeDecisionConditionBracketSkippedSuffix(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		conditions    []conditionResult
+		skippedChecks int
+		wantCI        string
+	}{
+		{
+			"non-zero skipped renders on a passing ci stage (ci=yes)",
+			[]conditionResult{{Key: "ci", Reached: true, Pass: true}},
+			6,
+			"ci=yes(skipped=6)",
+		},
+		{
+			"non-zero skipped renders on a holding ci stage (ci=no)",
+			[]conditionResult{{Key: "ci", Reached: true, Pass: false}},
+			9,
+			"ci=no(skipped=9)",
+		},
+		{
+			"zero skipped renders plain on a passing ci stage",
+			[]conditionResult{{Key: "ci", Reached: true, Pass: true}},
+			0,
+			"ci=yes",
+		},
+		{
+			"zero skipped renders plain on a holding ci stage",
+			[]conditionResult{{Key: "ci", Reached: true, Pass: false}},
+			0,
+			"ci=no",
+		},
+		{
+			// Regression pin: an unreached "ci" stage must render plain "-"
+			// even when SkippedChecks is non-zero (e.g. computed once at the
+			// top of evaluateAutomerge before an earlier stage, like
+			// "label", ever reaches the ci stage at all).
+			"unreached ci stage renders plain ci=- even with a non-zero skipped count",
+			[]conditionResult{{Key: "label", Reached: true, Pass: false}},
+			6,
+			"ci=-",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := automergeDecision{Conditions: tc.conditions, SkippedChecks: tc.skippedChecks}
+			bracket := d.conditionBracket()
+			// Exact-token check: a space-delimited field in the bracket must
+			// match wantCI exactly -- not merely strings.Contains, which
+			// would also (wrongly) pass if the suffix were rendered as a
+			// sibling stage rather than appended onto "ci".
+			parts := strings.Fields(strings.TrimSuffix(strings.TrimPrefix(bracket, "["), "]"))
+			found := false
+			for _, p := range parts {
+				if p == tc.wantCI {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("conditionBracket() = %q, want exactly one space-delimited token %q", bracket, tc.wantCI)
 			}
 		})
 	}

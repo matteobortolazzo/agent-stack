@@ -72,20 +72,21 @@ const (
 // collapsed into an existing reason, even though several are conceptually
 // related to one already above.
 const (
-	// automergeCIHold's per-bucket holds (Decision 1/2): CI is green only
-	// when at least one check exists and every check's bucket is exactly
-	// "pass". reasonNoChecks (zero checks at all) already exists above and
-	// is reused unchanged. These are the buckets the strict pass-only
-	// classifier distinguishes
-	// individually: fail, pending, cancel, skipping (gh 2.97's closed
-	// bucket set), an empty bucket string (malformed), and any
-	// future/unknown bucket value.
-	reasonCICheckFailed    = "CI check failed"
-	reasonCICheckPending   = "CI check pending"
-	reasonCICheckCancelled = "CI check cancelled"
-	reasonCICheckSkipped   = "CI check skipped"
-	reasonCIBucketEmpty    = "CI check bucket empty"
-	reasonCIBucketUnknown  = "CI check bucket unrecognized"
+	// automergeCIHold's per-bucket holds (Decisions 1/2, #1129): CI is green
+	// when at least one check is "pass" and every other check is "pass" or
+	// "skipping" -- a paths-filtered monorepo's skipped, unaffected-project
+	// checks must not hold automerge forever. reasonNoChecks (zero checks at
+	// all) already exists above and is reused unchanged. These are the
+	// remaining buckets the classifier distinguishes individually: fail,
+	// pending, cancel (gh 2.97's closed bucket set), an empty bucket string
+	// (malformed), and any future/unknown bucket value. reasonCIAllChecksSkipped
+	// covers the zero-pass, all-skipping case, distinct from reasonNoChecks.
+	reasonCICheckFailed      = "CI check failed"
+	reasonCICheckPending     = "CI check pending"
+	reasonCICheckCancelled   = "CI check cancelled"
+	reasonCIAllChecksSkipped = "all CI checks skipped"
+	reasonCIBucketEmpty      = "CI check bucket empty"
+	reasonCIBucketUnknown    = "CI check bucket unrecognized"
 
 	// Squash-only execution (Decision 3): a resolved policy mergeMethod
 	// other than "squash" holds here, evaluated before any allowed-merge-
@@ -204,6 +205,15 @@ type automergeDecision struct {
 	// caller matches on never changes shape.
 	Detail     string
 	Conditions []conditionResult
+	// SkippedChecks is the number of "skipping"-bucket checks counted at
+	// evaluation time (#1129 AC 11) -- purely diagnostic, rendered as a
+	// "(skipped=N)" suffix on the "ci" stage of conditionBracket when
+	// non-zero, so an operator can see at a glance how many paths-filtered
+	// checks were treated as pass-like. Not persisted onto State (no
+	// stateSchemaVersion bump): both consumers (logLine, the post-merge
+	// attribution comment) render from the live decision, never from
+	// State.AutomergeConditions.
+	SkippedChecks int
 	// FailureClass is the orthogonal "cause" axis to Reason's "site" axis
 	// (#886): which kind of underlying `gh` failure (command/timeout/
 	// cancelled/truncated/parse) produced this decision, via
@@ -237,10 +247,21 @@ func (d automergeDecision) logLine() string {
 // FailureClass is non-empty. Extracted so the durable record left on the PR
 // and the line written to the operator's log are the same rendering rather
 // than two independently-drifting ones.
+//
+// The "ci" stage additionally grows a "(skipped=N)" suffix (#1129 AC 11)
+// when the rendered symbol is not "-" (the stage was actually reached) AND
+// SkippedChecks > 0 -- gated on the rendered symbol, not merely on the field
+// being non-zero, so a SkippedChecks value computed once at the top of
+// evaluateAutomerge (before an earlier stage like "label" ever reaches "ci"
+// at all) never leaks onto an unreached "ci=-" stage.
 func (d automergeDecision) conditionBracket() string {
 	parts := make([]string, len(automergeStageKeys))
 	for i, k := range automergeStageKeys {
-		parts[i] = k + "=" + conditionSymbol(d.Conditions, k)
+		symbol := conditionSymbol(d.Conditions, k)
+		if k == "ci" && symbol != "-" && d.SkippedChecks > 0 {
+			symbol += fmt.Sprintf("(skipped=%d)", d.SkippedChecks)
+		}
+		parts[i] = k + "=" + symbol
 	}
 	bracket := strings.Join(parts, " ")
 	if d.FailureClass != "" {
@@ -327,11 +348,11 @@ type automergeInputs struct {
 	AllowedMethods    map[string]bool
 	AllowedMethodsErr error
 
-	// Checks is the strict pass-only CI classifier's input (#854): unlike
-	// ciStatus() (babysit.go), the pre-collapsed verdict that still feeds
-	// BlocksClose (#787) and must keep its existing semantics unchanged,
-	// Checks carries every check bucket so automergeCIHold can distinguish
-	// fail/pending/cancel/skipping/empty/unknown buckets individually
+	// Checks is automergeCIHold's input (#854, #1129): unlike ciStatus()
+	// (babysit.go), the pre-collapsed verdict that feeds BlocksClose (#787)
+	// and keeps its own, separately-evolving semantics, Checks carries every
+	// check bucket so automergeCIHold can distinguish fail/pending/cancel/
+	// empty/unknown buckets individually (treating skipping as pass-like)
 	// instead of collapsing them into a single "not green" reason.
 	Checks []check
 
@@ -362,24 +383,32 @@ type automergeInputs struct {
 	ReviewsComplete  bool
 }
 
-// automergeCIHold classifies checks under the strict pass-only rule
-// (Decision 1/2): CI is green only when at least one check exists and every
-// check's bucket is exactly "pass"; cancel, skipping, an empty bucket
-// string, and any future/unknown bucket each hold under their own distinct
-// reason. Buckets are scanned in the order checks appear, and the first
-// non-pass bucket found wins -- unlike ciStatus's severity-priority
-// ordering (fail beats pending), automerge's contract denies on ANY
-// non-pass bucket, so first-found-in-order is the simplest, most
-// predictable contract to specify and test. An empty checks slice reuses
-// the existing reasonNoChecks ("no CI checks reported") rather than a new
-// constant.
+// automergeCIHold classifies checks under the #1129 relaxed-skipping rule
+// (Decisions 1/2): CI is green when at least one check is "pass" and every
+// other check is "pass" or "skipping" -- a paths-filtered monorepo's
+// skipped, unaffected-project checks must not hold automerge forever.
+// Otherwise, buckets are scanned in the order checks appear treating
+// "skipping" as pass-like (never itself a holding bucket), and the first
+// genuinely non-pass bucket found wins its own distinct reason -- unlike
+// ciStatus's severity-priority ordering (fail beats pending), automerge's
+// contract denies on ANY non-pass/non-skipping bucket, so first-found-in-
+// order is the simplest, most predictable contract to specify and test. An
+// empty checks slice reuses the existing reasonNoChecks ("no CI checks
+// reported") rather than a new constant; a zero-pass, all-skipping set holds
+// under its own distinct reasonCIAllChecksSkipped instead.
 func automergeCIHold(checks []check) string {
 	if len(checks) == 0 {
 		return reasonNoChecks
 	}
+	tally := countBuckets(checks)
+	if tally.Pass >= 1 && tally.Pass+tally.Skipping == tally.Total {
+		return ""
+	}
 	for _, c := range checks {
 		switch c.Bucket {
 		case "pass":
+			continue
+		case "skipping":
 			continue
 		case "fail":
 			return reasonCICheckFailed
@@ -387,15 +416,17 @@ func automergeCIHold(checks []check) string {
 			return reasonCICheckPending
 		case "cancel":
 			return reasonCICheckCancelled
-		case "skipping":
-			return reasonCICheckSkipped
 		case "":
 			return reasonCIBucketEmpty
 		default:
 			return reasonCIBucketUnknown
 		}
 	}
-	return ""
+	// Every check is "skipping" (zero "pass") -- the green rule above
+	// requires at least one pass, so this loop falls through here rather
+	// than returning a per-bucket reason: distinct from reasonNoChecks
+	// (zero checks at all).
+	return reasonCIAllChecksSkipped
 }
 
 // automergeQueueHold classifies the merge-queue GraphQL probe's result
@@ -445,9 +476,16 @@ func automergeQueueHold(inQueue, enabled *bool, err error, probed bool) string {
 // discipline (decide.go:51-53).
 func evaluateAutomerge(in automergeInputs) automergeDecision {
 	var conds []conditionResult
+	// Computed once, up front, so both the "held" and "merged" return paths
+	// below carry the same diagnostic count (#1129 AC 11) -- independent of
+	// which stage the chain actually reaches, since a hold at an earlier
+	// stage (e.g. "label") must still render "ci=-" with no suffix via
+	// conditionBracket's own reached-symbol gate, not by this value being
+	// zero.
+	skipped := countBuckets(in.Checks).Skipping
 	fail := func(key, reason string) automergeDecision {
 		conds = append(conds, conditionResult{Key: key, Reached: true, Pass: false})
-		return automergeDecision{Merge: false, Reason: reason, Conditions: conds}
+		return automergeDecision{Merge: false, Reason: reason, Conditions: conds, SkippedChecks: skipped}
 	}
 	pass := func(key string) {
 		conds = append(conds, conditionResult{Key: key, Reached: true, Pass: true})
@@ -475,9 +513,10 @@ func evaluateAutomerge(in automergeInputs) automergeDecision {
 	}
 	pass("label")
 
-	// 3. Strict pass-only CI (Decisions 1/2, #854): every check bucket must
-	// be exactly "pass"; cancel/skipping/empty/unknown buckets each hold
-	// under their own distinct reason via automergeCIHold.
+	// 3. CI (Decisions 1/2, #854, relaxed by #1129): green when at least one
+	// check is "pass" and every other check is "pass" or "skipping";
+	// fail/pending/cancel/empty/unknown buckets each hold under their own
+	// distinct reason via automergeCIHold.
 	if hold := automergeCIHold(in.Checks); hold != "" {
 		return fail("ci", hold)
 	}
@@ -613,7 +652,7 @@ func evaluateAutomerge(in automergeInputs) automergeDecision {
 	}
 	pass("queue")
 
-	return automergeDecision{Merge: true, Reason: "", Conditions: conds}
+	return automergeDecision{Merge: true, Reason: "", Conditions: conds, SkippedChecks: skipped}
 }
 
 // detailMaxLen bounds sanitizeDetail's output length in bytes. Truncation

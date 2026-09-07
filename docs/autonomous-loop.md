@@ -338,9 +338,17 @@ fails closed to the interactive path.
 
 Planning also auto-adopts a settled posture: a posture already settled verbatim in a `Refined`, trusted-author ticket's `### Decisions`/`### Assumptions (auto-adopted)` is auto-adopted rather than re-asked — the decision already reached at `/cenci:refine`'s Confirmation Gate is not confirmed a second time. This narrows only the confirm/overrule trigger, never its cap priority, and only when the delegation's forwarded provenance is positively verified (a `Refined` label plus a trusted author association, and a quotable bullet the codebase doesn't contradict); unverifiable provenance falls back to asking: missing provenance, a missing `Refined` label, an untrusted or unrecognized author association, ticketless mode, or a failed resume-time provenance read all ask exactly as before.
 
-**The merge chain is fail-closed at every link.** "Green" is pass-only and strict: at
-least one check must exist and every check's bucket must be exactly `pass`. A
-cancelled, skipped, empty, or unrecognized bucket each hold under their own reason.
+**The merge chain is fail-closed at every link.** "Green" requires at least one check
+to be `pass`; every other check may be `pass` or `skipping` — a paths-filtered
+monorepo's unaffected-project checks (routinely `skipping`) no longer hold automerge
+forever. A `fail`, `pending`, `cancel`, empty, or unrecognized bucket still holds under
+its own reason, in the order checks appear; an all-`skipping` set with zero `pass`
+holds too, under its own distinct reason separate from "no checks reported". This is a
+merge-gate relaxation, not a new compensating control: a *required* check that gets
+skipped by a paths-filter misconfiguration no longer holds automerge on its own.
+Babysit adds no new probe for that case — the backstop is GitHub's own merge refusal,
+which surfaces as its own distinct hold reason (logged and retried, never bypassed) if
+the merge is actually rejected.
 Review feedback resolution is GitHub-authoritative — pushing a commit does not clear
 a thread; only `isResolved`, a `DISMISSED` review, or a newer `APPROVED` does. Any
 state babysit cannot positively confirm (unreadable, truncated pagination, unknown,
@@ -387,7 +395,7 @@ it was evaluated.
 |---|---|---|
 | `enabled` | Fleet kill switch | `automerge.enabled` is not `true` in `~/.config/cenci/config.json` |
 | `label` | Per-ticket grant | The PR closes no issue, an issue's labels are unreadable, or any closed issue lacks `automerge:ok` |
-| `ci` | Strict pass-only CI | No checks reported, or any check's bucket is `fail`, `pending`, `cancel`, `skipping`, empty, or unrecognized |
+| `ci` | CI green (≥1 `pass`, rest `pass`/`skipping`) | No checks reported, zero `pass` with the rest `skipping`, or any check's bucket is `fail`, `pending`, `cancel`, empty, or unrecognized |
 | `review` | Feedback | CI repair in flight, pending feedback, a reopened resolution, or a detection read that couldn't be proven complete |
 | `mergeable` | PR state | Draft, `MERGEABLE` unknown, or not mergeable |
 | `headsha` | Head commit | The PR's head SHA is unreadable at evaluation time |
@@ -403,6 +411,12 @@ A trailing `class=<class>` appears when the hold came from a `gh` failure
 (command/timeout/cancelled/truncated/parse). Every hold has its own distinct reason
 string — dozens of them, never collapsed into a shared one — precisely so a log line
 tells you which link broke rather than a generic "not ready".
+
+Once the `ci` stage is reached, a non-zero count of `skipping` checks renders as a
+suffix, e.g. `ci=yes(skipped=6)` or `ci=no(skipped=9)` — diagnostic only, it never
+changes the verdict. A zero skipped count renders the plain `ci=yes`/`ci=no`, and an
+unreached `ci` stage still renders the plain `-` (as in the example above, where
+`label` failed first and `ci` was never evaluated).
 
 Three reasons need a human and will not clear on their own: `review feedback state
 unreadable`, `review feedback state unknown` (GitHub stopped reporting a comment or
