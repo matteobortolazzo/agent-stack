@@ -71,6 +71,7 @@ This prevents readers and future implementers from assuming the code is actively
 | `CENCI-SANDBOX-DIND-001` | Sandbox / Dind | The nested Docker daemon (DinD) failed to start, or crashed/OOMed after starting, without an intentional-shutdown sentinel superseding the marker. Attached by the launcher's before-attach warning and by `cenci diagnose`. |
 | `CENCI-SANDBOX-DIND-002` | Sandbox / Dind | Nested Docker was requested (`--dind` or `sandbox.dind`) on a host that can never register `sysbox-runc` — macOS — so the sandbox launched without it. Attached by the launcher's degrade warning and reported by `cenci audit` as the `platform-unsupported` dind source. |
 | `CENCI-SANDBOX-DIND-003` | Sandbox / Dind | A dind launch's container create was rejected by the OCI runtime: `sysbox-runc` is registered with Docker (so `dindPreflight` passed) but could not create the container. Attached by the launcher's create-failure mapping. |
+| `CENCI-SANDBOX-SOCKET-001` | Sandbox / Socket | A failed in-sandbox hook-event delivery is unrecoverable and container-scoped: the event-socket directory's bind mount is dangling or was never wired in (or the mount probe was inconclusive). Attached by `internal/daemon`'s delivery-failure classifier and surfaced by `cenci diagnose`'s "Event delivery:" section. |
 | `CENCI-DAEMON-CONN-001` | Daemon / Conn | The cenci daemon's event socket exists but did not answer a read-only dial. Attached by `cenci diagnose`. |
 | `CENCI-DAEMON-SOCKET-001` | Daemon / Socket | The cenci daemon's event socket does not exist at all. Attached by `cenci diagnose`. |
 
@@ -133,3 +134,20 @@ DIND-002 before the launch (the host can never register `sysbox-runc`),
 DIND-003 during container create (registered but non-functional),
 DIND-001 after create (the container exists, the inner `dockerd` didn't
 start or later died).
+
+`CENCI-SANDBOX-SOCKET-001` (#1122) is attached by `internal/daemon`'s
+`classifyDeliveryFailure`, called from `deliverEvent` when an in-sandbox
+`cenci notify` fails to deliver a hook event to the default event socket and
+its one retry (`EnsureRunning`'s in-sandbox no-op) is also exhausted. It
+partitions against the pre-existing, host-scoped `CENCI-DAEMON-SOCKET-001`
+by probing `/proc/self/mountinfo` for the socket directory's bind mount:
+`CENCI-SANDBOX-SOCKET-001` covers the unrecoverable, container-scoped cases
+— the mount is dangling (its source vanished from the mount namespace), was
+never wired in at all, or the probe itself was inconclusive (unreadable or
+malformed mountinfo, treated conservatively) — none of which can self-heal;
+the only remediation is recreating the container. `CENCI-DAEMON-SOCKET-001`
+covers the recoverable, host-scoped case: the mount is healthy, so the
+failure is the host daemon not being reachable, fixed by `cenci daemon
+start`. The classification is persisted to a home-volume marker
+(`/home/dev/.cenci-events-undelivered`) and surfaced host-side by `cenci
+diagnose`'s always-on "Event delivery:" section.

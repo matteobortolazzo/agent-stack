@@ -2,11 +2,14 @@ package launcher
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
+	"github.com/matteobortolazzo/cenci/watch/v2/internal/daemon"
 	"github.com/matteobortolazzo/cenci/watch/v2/internal/errcode"
 )
 
@@ -418,5 +421,224 @@ func TestDiagnose_NestedDocker_MarkerPresent_AttachesDegradedFinding(t *testing.
 	}
 	if !strings.Contains(out, string(SeverityDegraded)) {
 		t.Errorf("expected degraded severity for the dind startup-failure finding, got:\n%s", out)
+	}
+}
+
+// -- Event delivery (#1122): always-on "Event delivery:" section -----------
+//
+// Mirrors the Nested Docker section's always-on-line convention: "no failure
+// recorded" when the .cenci-events-undelivered home-volume marker is absent,
+// the marker's message plus a severity-mapped finding when present, and an
+// explicit [warning] finding (never silent omission) when the marker exists
+// but fails to parse.
+
+func TestDiagnose_EventDelivery_NoFailureRecorded(t *testing.T) {
+	fakeDir := t.TempDir()
+	callLog := filepath.Join(fakeDir, "calls.txt")
+	writeFakeRuntime(t, fakeDir, "docker", callLog)
+	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	e := &Engine{Runtime: "docker", Stdout: &stdout, Stderr: &stderr}
+	// FAKE_EVENTS_MARKER unset: no undelivered-events marker was ever written.
+
+	if err := e.Diagnose(dindDiagnoseScope()); err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "Event delivery: no failure recorded") {
+		t.Errorf("expected an always-on \"Event delivery:\" line reporting no failure, got:\n%s", out)
+	}
+}
+
+func TestDiagnose_EventDelivery_ValidMarker_AttachesDegradedFinding(t *testing.T) {
+	fakeDir := t.TempDir()
+	callLog := filepath.Join(fakeDir, "calls.txt")
+	writeFakeRuntime(t, fakeDir, "docker", callLog)
+	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	e := &Engine{Runtime: "docker", Stdout: &stdout, Stderr: &stderr}
+	const message = "the sandbox socket directory's bind mount is dangling inside this container; recreate the container to restore it"
+	marker := `{"session_id":"sess-1","code":"` + string(errcode.SandboxSocketUnwired) + `","message":"` + message + `","timestamp":"2026-09-07T00:00:00Z"}`
+	t.Setenv("FAKE_EVENTS_MARKER", marker)
+
+	if err := e.Diagnose(dindDiagnoseScope()); err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "Event delivery:") {
+		t.Errorf("expected an always-on \"Event delivery:\" line, got:\n%s", out)
+	}
+	if !strings.Contains(out, message) {
+		t.Errorf("expected the marker message surfaced verbatim, got:\n%s", out)
+	}
+	if !strings.Contains(out, string(errcode.SandboxSocketUnwired)) {
+		t.Errorf("expected %s attached for the recorded delivery failure, got:\n%s", errcode.SandboxSocketUnwired, out)
+	}
+	if !strings.Contains(out, string(SeverityDegraded)) {
+		t.Errorf("expected degraded severity for the event-delivery finding, got:\n%s", out)
+	}
+}
+
+func TestDiagnose_EventDelivery_UnparseableMarker_ReportsWarningNotOmitted(t *testing.T) {
+	fakeDir := t.TempDir()
+	callLog := filepath.Join(fakeDir, "calls.txt")
+	writeFakeRuntime(t, fakeDir, "docker", callLog)
+	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	e := &Engine{Runtime: "docker", Stdout: &stdout, Stderr: &stderr}
+	t.Setenv("FAKE_EVENTS_MARKER", "not valid json")
+
+	if err := e.Diagnose(dindDiagnoseScope()); err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "Event delivery:") {
+		t.Errorf("expected an always-on \"Event delivery:\" line, got:\n%s", out)
+	}
+	if !strings.Contains(out, "["+string(SeverityWarning)+"]") {
+		t.Errorf("expected an explicit [warning] finding for the unparseable marker rather than silent omission, got:\n%s", out)
+	}
+	if !strings.Contains(out, "unparseable") {
+		t.Errorf("expected the warning finding to name the unparseable marker, got:\n%s", out)
+	}
+}
+
+// -- sanitizeEventDeliveryMessage (#1122 fix cycle: sanitizer hardening) ----
+
+// TestSanitizeEventDeliveryMessage_StripsControlAndBidiCharacters pins fix 1:
+// the sanitizer must strip not just ASCII C0 control bytes and DEL, but also
+// C1 control characters and Unicode bidi-override characters that could
+// otherwise spoof or manipulate terminal output.
+func TestSanitizeEventDeliveryMessage_StripsControlAndBidiCharacters(t *testing.T) {
+	input := "safe\x1btext\u009bmore\rhere\x7fend\u202etail"
+	got := sanitizeEventDeliveryMessage(input)
+
+	for _, bad := range []string{"\x1b", "\u009b", "\r", "\x7f", "\u202e"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("sanitizeEventDeliveryMessage(%q) = %q; must not contain stripped char %q", input, got, bad)
+		}
+	}
+	want := "safetextmorehereendtail"
+	if got != want {
+		t.Errorf("sanitizeEventDeliveryMessage(%q) = %q, want %q", input, got, want)
+	}
+}
+
+// TestSanitizeEventDeliveryMessage_TruncationProducesValidUTF8 pins fix 2:
+// truncating over maxEventDeliveryMessageLen must never split a multi-byte
+// UTF-8 rune. The input is built so a naive byte-length cut at exactly
+// maxEventDeliveryMessageLen would land in the middle of a 3-byte rune.
+func TestSanitizeEventDeliveryMessage_TruncationProducesValidUTF8(t *testing.T) {
+	prefix := strings.Repeat("a", maxEventDeliveryMessageLen-1)
+	input := prefix + "€€€€€€€€€€" // "€" (U+20AC) is 3 bytes; starts exactly one byte before the cutoff
+
+	got := sanitizeEventDeliveryMessage(input)
+
+	if !utf8.ValidString(got) {
+		t.Fatalf("sanitizeEventDeliveryMessage truncated output is not valid UTF-8: %q", got)
+	}
+	if len(got) > maxEventDeliveryMessageLen {
+		t.Errorf("sanitizeEventDeliveryMessage output length = %d, want <= %d", len(got), maxEventDeliveryMessageLen)
+	}
+	if strings.Contains(got, "�") {
+		t.Errorf("sanitizeEventDeliveryMessage output contains a replacement character (partial rune): %q", got)
+	}
+}
+
+// TestDiagnose_EventDelivery_MessageWithEscapeSequence_StripsRawEscapeByte is
+// an end-to-end proof (fix 1/2) that the sanitizer's fix actually reaches the
+// printed diagnose line, not just the helper in isolation: a marker message
+// containing a raw ANSI escape sequence must not leave a raw ESC byte in
+// stdout.
+func TestDiagnose_EventDelivery_MessageWithEscapeSequence_StripsRawEscapeByte(t *testing.T) {
+	fakeDir := t.TempDir()
+	callLog := filepath.Join(fakeDir, "calls.txt")
+	writeFakeRuntime(t, fakeDir, "docker", callLog)
+	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	e := &Engine{Runtime: "docker", Stdout: &stdout, Stderr: &stderr}
+	// Built via json.Marshal (rather than a hand-written JSON literal) so the
+	// raw ESC byte (0x1b) in Message is correctly JSON-escaped by the encoder,
+	// then decodes back into an actual ESC rune in m.Message when
+	// eventDeliveryFinding parses it.
+	esc := string(rune(0x1b))
+	b, err := json.Marshal(daemon.UndeliveredEventsMarker{
+		SessionID: "sess-1",
+		Code:      errcode.SandboxSocketUnwired,
+		Message:   "clear screen " + esc + "[2J attack",
+		Timestamp: "2026-09-07T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal marker: %v", err)
+	}
+	t.Setenv("FAKE_EVENTS_MARKER", string(b))
+
+	if err := e.Diagnose(dindDiagnoseScope()); err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+
+	out := stdout.String()
+	if strings.ContainsRune(out, rune(0x1b)) {
+		t.Errorf("expected no raw ESC byte in diagnose output, got:\n%q", out)
+	}
+}
+
+// TestDiagnose_EventDelivery_UnregisteredCode_ReportsWarningNamingTheCode
+// pins fixes 3 and 4, and the silent-failure-hunter's missing-coverage
+// finding: valid JSON whose code field is well-formed but does not resolve
+// via errcode.Lookup must surface as an explicit [warning] finding naming
+// the unrecognized code, distinct in wording from the "unparseable JSON"
+// case (it must not say "unparseable" — the JSON parsed fine).
+func TestDiagnose_EventDelivery_UnregisteredCode_ReportsWarningNamingTheCode(t *testing.T) {
+	fakeDir := t.TempDir()
+	callLog := filepath.Join(fakeDir, "calls.txt")
+	writeFakeRuntime(t, fakeDir, "docker", callLog)
+	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	e := &Engine{Runtime: "docker", Stdout: &stdout, Stderr: &stderr}
+	const bogusCode = "CENCI-BOGUS-999"
+	marker := `{"session_id":"s1","code":"` + bogusCode + `","message":"x","timestamp":"2024-01-01T00:00:00Z"}`
+	t.Setenv("FAKE_EVENTS_MARKER", marker)
+
+	if err := e.Diagnose(dindDiagnoseScope()); err != nil {
+		t.Fatalf("Diagnose: %v", err)
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "["+string(SeverityWarning)+"]") {
+		t.Errorf("expected an explicit [warning] finding for the unrecognized code rather than silent omission, got:\n%s", out)
+	}
+	if !strings.Contains(out, bogusCode) {
+		t.Errorf("expected the finding to name the unrecognized code %q, got:\n%s", bogusCode, out)
+	}
+	if strings.Contains(out, "unparseable") {
+		t.Errorf("expected wording distinct from the unparseable-JSON case (the JSON parsed fine; only the code was unrecognized), got:\n%s", out)
+	}
+	if !strings.Contains(out, "unrecognized code") {
+		t.Errorf("expected wording naming an \"unrecognized code\", got:\n%s", out)
+	}
+}
+
+// TestVerify_DoesNotGainAnEventDeliveryCheck pins AC #14: --verify output
+// must not change — no new entry in verifyChecks for the event-delivery
+// marker.
+func TestVerify_DoesNotGainAnEventDeliveryCheck(t *testing.T) {
+	labels := make(map[string]bool, len(verifyChecks))
+	for _, c := range verifyChecks {
+		labels[c.Label] = true
+	}
+	if labels["event delivery"] {
+		t.Error("verifyChecks must not gain an \"event delivery\" check (AC: --verify output is unchanged)")
+	}
+	if len(verifyChecks) != 2 {
+		t.Errorf("verifyChecks has %d entries, want 2 (daemon reachability, container existence) — --verify output must not change", len(verifyChecks))
 	}
 }

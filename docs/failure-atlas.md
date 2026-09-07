@@ -335,3 +335,41 @@ disappears with it even though the daemon process may still think it is
 running — check `cenci daemon status` first before assuming the daemon
 itself has died. The state tier (`~/.local/state/...`) is not subject to
 this hazard, since tmp-cleaning cron jobs do not target it.
+
+## CENCI-SANDBOX-SOCKET-001
+
+**Meaning**: An in-sandbox `cenci notify` failed to deliver a hook event to
+the default event socket, its one retry (`EnsureRunning`'s in-sandbox
+no-op) was also exhausted, and `internal/daemon`'s `classifyDeliveryFailure`
+determined the failure is unrecoverable and container-scoped: the
+event-socket directory's bind mount is dangling (its source vanished from
+the mount namespace), was never wired into the container at all, or the
+mount probe itself was inconclusive (unreadable or malformed
+`/proc/self/mountinfo`, treated conservatively as this container-scoped
+case rather than assuming the recoverable host-scoped one). Distinct from
+`CENCI-DAEMON-SOCKET-001`, where the mount is healthy and the failure is
+the host daemon not being reachable. The classification is persisted to a
+home-volume marker (`/home/dev/.cenci-events-undelivered`) and surfaced
+host-side by `cenci diagnose`'s always-on "Event delivery:" section.
+
+**Common causes**:
+- The container's event-socket bind mount source was removed on the host after the container started (dangling mount).
+- The container was launched without the event-socket directory bind-mounted at all.
+
+**Diagnostic commands**:
+```bash
+cenci diagnose --name <session>
+```
+
+**Recovery procedure**:
+1. Run `cenci sandbox stop <name>` to stop the affected session's container.
+2. Relaunch the session (`cenci open <shortcut>`) so a fresh container gets
+   the event-socket directory bind-mounted correctly — a container's mounts
+   are fixed for its lifetime and can never self-heal in place.
+3. Re-run `cenci diagnose --name <session>` to confirm the "Event delivery:"
+   section now reports "no failure recorded".
+
+**Platform notes**: The classifier reads `/proc/self/mountinfo` from inside
+the container, which is Linux-specific; it treats any read failure or
+malformed line as inconclusive and defaults to this conservative,
+container-scoped verdict rather than the recoverable host-scoped one.

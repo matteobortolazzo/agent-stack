@@ -109,6 +109,24 @@ const (
 	SandboxDindRuntimeCreateFailed Code = "CENCI-SANDBOX-DIND-003"
 )
 
+// Sandbox socket codes (CENCI-SANDBOX-SOCKET-*), attached by
+// watch/internal/daemon's in-sandbox hook-event delivery-failure classifier
+// (classifyDeliveryFailure) and surfaced host-side by
+// watch/internal/sandbox/launcher/diagnose.go's "Event delivery:" section.
+const (
+	// SandboxSocketUnwired is attached when a failed in-sandbox hook-event
+	// delivery is unrecoverable and container-scoped: the event-socket
+	// directory's bind mount is dangling (its source vanished from the
+	// mount namespace) or was never wired in at all, or the mount probe
+	// itself was inconclusive (unreadable/malformed /proc/self/mountinfo —
+	// treated conservatively as container-scoped rather than assuming the
+	// recoverable host-scoped case). Distinct from the pre-existing,
+	// host-scoped DaemonSocketMissing: a container's mounts are fixed for
+	// its lifetime, so this never self-heals — the only remediation is
+	// recreating the container.
+	SandboxSocketUnwired Code = "CENCI-SANDBOX-SOCKET-001"
+)
+
 // Daemon reachability codes (CENCI-DAEMON-*), attached by `cenci diagnose`'s
 // read-only daemon probe.
 const (
@@ -202,6 +220,17 @@ var registry = map[Code]Entry{
 			"cenci open <shortcut> --no-dind to launch without nested Docker",
 		},
 	},
+	SandboxSocketUnwired: {
+		Message: "The sandbox event-socket directory's bind mount is dangling or was never wired in.",
+		Causes: []string{
+			"The container's event-socket bind mount source was removed on the host after the container started (dangling mount).",
+			"The container was launched without the event-socket directory bind-mounted at all.",
+		},
+		Hints: []string{
+			"cenci sandbox stop <name>, then relaunch the session",
+			"cenci diagnose --name <session>",
+		},
+	},
 	DaemonConnUnreachable: {
 		Message: "The cenci daemon did not answer on its event socket.",
 		Causes: []string{
@@ -238,6 +267,7 @@ var allCodes = []Code{
 	SandboxDindStartupFailure,
 	SandboxDindPlatformUnsupported,
 	SandboxDindRuntimeCreateFailed,
+	SandboxSocketUnwired,
 	DaemonConnUnreachable,
 	DaemonSocketMissing,
 }
