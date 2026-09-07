@@ -704,16 +704,27 @@ func (e *Engine) warnDindPlatformUnsupported() {
 // attach (#630's Q1: warn, still attach — matches #586's non-blocking
 // dockerd-start mandate; never hard-blocks or returns an error). Gated on
 // ctx.DindOn so a non-dind launch never even attempts the marker read (that
-// path never exists for a non-dind session's home volume).
+// path never exists for a non-dind session's home volume). A read failure
+// (#1163: the runtime itself could not be trusted, not "no marker") prints a
+// distinct one-line warning naming the read failure, separate wording from
+// the marker-present warning below — "we could not look" must never be
+// silently indistinguishable from "nothing to report". A successful read is
+// re-sanitized with the single-line/head-keeping sanitizer (on top of the
+// chokepoint's multi-line one) before it's printed: this warning is a
+// single line, and the marker is container-writable — an embedded "\n"
+// could otherwise forge extra, legitimate-looking terminal output (#1163
+// security review).
 func (e *Engine) warnDockerdStartupFailure(ctx launchCtx) {
 	if !ctx.DindOn {
 		return
 	}
-	content, ok := e.readHomeVolumeFile(ctx.Scope, dockerdFailureMarkerPath)
-	if !ok {
-		return
+	content, status := e.readHomeVolumeFile(ctx.Scope, dockerdFailureMarkerPath)
+	switch status {
+	case homeVolumeReadOK:
+		_, _ = fmt.Fprintf(e.Stderr, "Warning: the nested Docker daemon (DinD) failed to start [%s]: %s\n", errcode.SandboxDindStartupFailure, sanitizeEventDeliveryMessage(content))
+	case homeVolumeReadFailed:
+		_, _ = fmt.Fprintln(e.Stderr, "Warning: could not read the dockerd startup marker; the read failed, so nested Docker (DinD) status for this session is unknown.")
 	}
-	_, _ = fmt.Fprintf(e.Stderr, "Warning: the nested Docker daemon (DinD) failed to start [%s]: %s\n", errcode.SandboxDindStartupFailure, content)
 }
 
 // baseRunArgs builds the container identity/lifecycle flags shared by every
@@ -1281,30 +1292,98 @@ func (e *Engine) containerStartupState(name string) (status, exitCode string, er
 	return fields[0], fields[1], nil
 }
 
+// homeVolumeReadStatus classifies a readHomeVolumeFile outcome into three
+// distinct classes (#1163) so callers can tell "the marker legitimately does
+// not exist" apart from "we could not even look" — collapsing them into a
+// single ok bool made a docker/podman daemon failure (`run --entrypoint
+// /bin/cat` exiting 125) indistinguishable from a legitimately missing
+// marker (`cat`'s ordinary exit 1), which made several Diagnose findings
+// falsely report "no failure recorded" when the truth was "we could not
+// look" (watch/docs/go-gotchas.md #598/#822: never collapse a legitimate
+// false answer and a command failure into the same value).
+type homeVolumeReadStatus int
+
+const (
+	// homeVolumeReadOK means the read succeeded and the raw content was
+	// non-empty before sanitization. The sanitized content this status
+	// pairs with can still be "" in the rare case the raw bytes consisted
+	// entirely of control/bidi runes the sanitizer strips — callers that
+	// render it must handle that case explicitly rather than assuming
+	// non-empty (see pluginManifestVersionDisplay).
+	homeVolumeReadOK homeVolumeReadStatus = iota
+	// homeVolumeReadAbsent means the marker legitimately does not exist:
+	// `cat` exited non-zero for a reason other than 125/126/127 (its
+	// ordinary "no such file" exit 1), or the read succeeded but returned
+	// empty content.
+	homeVolumeReadAbsent
+	// homeVolumeReadFailed means the read itself could not be trusted: the
+	// container runtime rejected or couldn't execute the request (exit
+	// 125/126/127), or the runtime binary itself could not be invoked at
+	// all (a non-*exec.ExitError, e.g. "executable file not found").
+	homeVolumeReadFailed
+)
+
+// classifyHomeVolumeReadExit classifies a `run --entrypoint /bin/cat` exit
+// code (#1163): 125 ("docker/podman run itself rejected the request"), 126
+// ("command invoked cannot execute"), and 127 ("command not found") all mean
+// the runtime could not even attempt the read, so they're read-failed. Any
+// other non-zero exit is `cat`'s own ordinary "no such file" signal (exit 1)
+// or similar, which is a legitimately absent marker.
+func classifyHomeVolumeReadExit(exitCode int) homeVolumeReadStatus {
+	switch exitCode {
+	case 125, 126, 127:
+		return homeVolumeReadFailed
+	default:
+		return homeVolumeReadAbsent
+	}
+}
+
 // readHomeVolumeFile reads path from scope's home volume via a short-lived
 // container (`run --rm --user root --entrypoint /bin/cat ...`), since the
 // failed workload container may already be gone (auto-removed by --rm). It
-// returns the trimmed content and whether the read succeeded with non-empty
-// content.
-func (e *Engine) readHomeVolumeFile(scope Scope, path string) (string, bool) {
+// returns the sanitized, trimmed content and a homeVolumeReadStatus
+// classifying the outcome (#1163). Successful, non-empty content is passed
+// through sanitizeHomeVolumeContent (diagnose.go) before it's returned, so
+// every caller downstream of this chokepoint automatically gets
+// control/bidi-byte stripping and bounded, tail-keeping truncation without
+// having to sanitize individually.
+func (e *Engine) readHomeVolumeFile(scope Scope, path string) (string, homeVolumeReadStatus) {
 	cmd := exec.Command(e.Runtime, "run", "--rm", "--user", "root", "--entrypoint", "/bin/cat",
 		"-v", scope.VolumeName+":/home/dev", scope.Image, path)
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) {
-			// cat legitimately exiting non-zero (file absent) is the expected,
-			// silent per-tier case. Anything else means the runtime binary
-			// itself failed to run, which will make all three home-volume
-			// reads and the `docker logs` fallback fail identically — worth
-			// surfacing so the operator isn't misdirected to the generic
-			// fallback message (#473).
+			// The runtime binary itself failed to run (e.g. not found on
+			// PATH) — not `cat` reporting anything, ExitError or otherwise.
+			// This will make all three home-volume reads and the `docker
+			// logs` fallback fail identically — worth surfacing here so the
+			// operator isn't misdirected to a generic fallback message
+			// later, unaware the runtime itself was unreachable (#473).
+			// classifyHomeVolumeReadExit's own callers (nestedDockerFinding,
+			// warnDockerdStartupFailure, etc.) surface a read-failed finding
+			// or warning for the ExitError case below, so this is the only
+			// stderr warning readHomeVolumeFile itself prints.
 			_, _ = fmt.Fprintf(e.Stderr, "Warning: failed to run %s to read %s from the home volume (%v); startup diagnostics may be incomplete.\n", e.Runtime, path, err)
+			return "", homeVolumeReadFailed
 		}
-		return "", false
+		return "", classifyHomeVolumeReadExit(exitErr.ExitCode())
 	}
-	content := strings.TrimSpace(string(out))
-	return content, content != ""
+	// The OK-vs-absent decision is made on the RAW trimmed bytes, before
+	// sanitization — deciding it after sanitizing would let a genuinely
+	// successful read (exit 0, non-empty raw content) that happens to
+	// consist entirely of stripped control/bidi bytes sanitize down to "",
+	// misclassifying it as homeVolumeReadAbsent ("legitimately does not
+	// exist") when the truth is "we read real content, all of which turned
+	// out to be unprintable". homeVolumeReadOK's own content can still be
+	// "" after this sanitize call in that edge case — callers that render
+	// it already anticipate an OK-but-empty content (e.g.
+	// pluginManifestVersionDisplay's own emptiness check).
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		return "", homeVolumeReadAbsent
+	}
+	return sanitizeHomeVolumeContent(raw), homeVolumeReadOK
 }
 
 // lastLines returns at most the last n lines of s.
@@ -1329,10 +1408,18 @@ func lastLines(s string, n int) string {
 //  3. /home/dev/.cenci-startup-failed — the generic EXIT-trap marker the
 //     entrypoint writes for any non-zero exit once the tee is installed, for
 //     failures where the boot log itself is empty.
-//  4. The container's last 50 `docker/podman logs` lines, for failures
-//     outside the entrypoint's own diagnostics (e.g. before the tee/trap were
-//     installed).
-//  5. A fully generic fallback string, if none of the above yielded anything.
+//  4. The container's last 50 `docker/podman logs` lines (sanitized with the
+//     multi-line sanitizer, #1163), for failures outside the entrypoint's
+//     own diagnostics (e.g. before the tee/trap were installed).
+//  5. A read-failed fallback string, if ANY of the three home-volume reads
+//     above (#1163's Q1) came back homeVolumeReadFailed and the logs
+//     fallback yielded nothing — "we could not look" must never be silently
+//     reported as the fully generic fallback below, which claims the
+//     entrypoint was definitively found to have failed with no diagnostic
+//     trace.
+//  6. A fully generic fallback string, only when every one of the three
+//     reads was definitively homeVolumeReadAbsent (never failed) and the
+//     logs fallback also yielded nothing.
 //
 // All home-volume reads happen via a short-lived container against the home
 // volume, since the failed container itself may already be gone.
@@ -1340,21 +1427,55 @@ func lastLines(s string, n int) string {
 // The returned errcode.Code classifies which case fired:
 // errcode.SandboxStartAgentCLIMissing for case 1 (the agent-CLI-missing
 // marker); errcode.SandboxStartGenericEntrypoint for every other case
-// (2 through 5), since they all represent the same "generic entrypoint
+// (2 through 6), since they all represent the same "generic entrypoint
 // failure" class the ticket distinguishes from the agent-CLI-missing case.
 func (e *Engine) startupFailureDetail(scope Scope) (string, errcode.Code) {
-	if content, ok := e.readHomeVolumeFile(scope, "/home/dev/.cenci-agent-startup-error"); ok {
+	anyReadFailed := false
+
+	// Each tier below only treats the read as a "hit" when it's OK AND
+	// non-empty: fix #2 (#1163 security review) made readHomeVolumeFile
+	// return (homeVolumeReadOK, "") for a genuinely successful read whose
+	// content sanitizes down to empty (e.g. a marker containing only
+	// stripped control bytes), rather than misclassifying it as Absent. If
+	// a plain `case homeVolumeReadOK` matched that, a container could write
+	// an all-control-byte marker to suppress every remaining tier (and the
+	// anyReadFailed fallback) down to a bare error code with no detail —
+	// falling through on OK-but-empty, exactly like the existing
+	// fall-through on Absent, closes that (#1163 security re-review).
+
+	content, status := e.readHomeVolumeFile(scope, "/home/dev/.cenci-agent-startup-error")
+	switch {
+	case status == homeVolumeReadOK && content != "":
 		return content, errcode.SandboxStartAgentCLIMissing
+	case status == homeVolumeReadFailed:
+		anyReadFailed = true
 	}
-	if content, ok := e.readHomeVolumeFile(scope, "/home/dev/.cenci-boot.log"); ok {
+
+	content, status = e.readHomeVolumeFile(scope, "/home/dev/.cenci-boot.log")
+	switch {
+	case status == homeVolumeReadOK && content != "":
 		return lastLines(content, 50), errcode.SandboxStartGenericEntrypoint
+	case status == homeVolumeReadFailed:
+		anyReadFailed = true
 	}
-	if content, ok := e.readHomeVolumeFile(scope, "/home/dev/.cenci-startup-failed"); ok {
+
+	content, status = e.readHomeVolumeFile(scope, "/home/dev/.cenci-startup-failed")
+	switch {
+	case status == homeVolumeReadOK && content != "":
 		return content, errcode.SandboxStartGenericEntrypoint
+	case status == homeVolumeReadFailed:
+		anyReadFailed = true
 	}
+
 	logs := exec.Command(e.Runtime, "logs", "--tail", "50", scope.ContainerName)
-	if out, err := logs.CombinedOutput(); err == nil && strings.TrimSpace(string(out)) != "" {
-		return strings.TrimSpace(string(out)), errcode.SandboxStartGenericEntrypoint
+	if out, err := logs.CombinedOutput(); err == nil {
+		if sanitized := sanitizeHomeVolumeContent(strings.TrimSpace(string(out))); sanitized != "" {
+			return sanitized, errcode.SandboxStartGenericEntrypoint
+		}
+	}
+
+	if anyReadFailed {
+		return "could not read startup diagnostics from the container runtime (the read failed)", errcode.SandboxStartGenericEntrypoint
 	}
 	return "entrypoint exited before initialization completed", errcode.SandboxStartGenericEntrypoint
 }

@@ -225,11 +225,20 @@ func joinArgv(argv []string) string {
 //	                        both the launcher's before-attach warning
 //	                        (warnDockerdStartupFailure) and `cenci diagnose`'s
 //	                        "Nested Docker:" section. Unset/empty simulates no
-//	                        recorded failure.
-//	FAKE_VOLUME_INSPECT_EXIT — `volume inspect <name>` exit code (default 0 =
-//	                        the volume exists); `cenci diagnose`'s dind-session
-//	                        probe (#630) treats non-zero as "not a dind
-//	                        session" (scope.DindVolumeName was never created).
+//	                        recorded failure. FAKE_DOCKERD_MARKER_EXIT
+//	                        (default 0) is that same read's exit code — set
+//	                        it to 125/126/127 (#1163) to script
+//	                        readHomeVolumeFile's read-failed classification;
+//	                        any other non-zero exit (e.g. 1) scripts the
+//	                        legitimately-absent classification instead.
+//	FAKE_EVENTS_MARKER   — content returned by the short-lived
+//	                        `run --entrypoint /bin/cat ... .cenci-events-
+//	                        undelivered` home-volume read (#1122's
+//	                        dropped-event marker); unset/empty simulates "no
+//	                        failure recorded". FAKE_EVENTS_MARKER_EXIT
+//	                        (default 0) is that same read's exit code, same
+//	                        125/126/127 scripting convention as
+//	                        FAKE_DOCKERD_MARKER_EXIT above (#1163).
 //	FAKE_IMAGE_ID        — `image inspect --format '{{.Id}}' <image>` stdout
 //	                        (ticket #947's printStaleContainerNotice: the
 //	                        freshly built image's ID), told apart by the
@@ -409,7 +418,6 @@ ps)
 volume)
   case "$2" in
   ls) fv VOLUMES ""; exit "$(fe VOLUME_LS)" ;;
-  inspect) exit "$(fe VOLUME_INSPECT)" ;;
   esac
   ;;
 info) fv INFO_RUNTIMES "{}"; exit "$(fe INFO)" ;;
@@ -421,6 +429,7 @@ run) case "$*" in
     *'.cenci-boot.log'*) fv BOOT_LOG ""; exit "$(fe BOOT_LOG)" ;;
     *'.cenci-startup-failed'*) fv STARTUP_MARKER ""; exit "$(fe STARTUP_MARKER)" ;;
     *'.cenci-dockerd-startup-error'*) fv DOCKERD_MARKER ""; exit "$(fe DOCKERD_MARKER)" ;;
+    *'.cenci-events-undelivered'*) fv EVENTS_MARKER ""; exit "$(fe EVENTS_MARKER)" ;;
     *'marketplace.json'*) fv PLUGIN_MANIFEST ""; exit "$(fe PLUGIN_MANIFEST)" ;;
     esac
     ;;
@@ -2186,6 +2195,169 @@ func TestOpen_GenericEntrypointFailureSurfacesStartupMarker(t *testing.T) {
 	}
 	if strings.Contains(string(output), "CENCI-SANDBOX-START-001") {
 		t.Errorf("expected only the generic-entrypoint code, not the agent-CLI-missing code, got:\n%s", output)
+	}
+}
+
+// -- ticket #1163 Q1: startupFailureDetail's mixed read-failed fallback ----
+//
+// startupFailureDetail checks up to three home-volume markers plus a
+// `logs --tail 50` fallback, in precedence order. Before #1163, every
+// non-successful read (a legitimate "no such marker" AND a genuine runtime
+// read failure) was silently the same "absent" outcome, so a
+// daemon-unreachable failure on all three reads degraded into the generic
+// "entrypoint exited before initialization completed" fallback — actively
+// misleading, since nothing was actually learned about the entrypoint at
+// all. Q1's rule: if ANY of the three reads comes back read-failed, emit a
+// distinct read-failed fallback string instead; the generic fallback is
+// reserved for the case where every read was DEFINITIVELY absent (and the
+// logs fallback also yielded nothing).
+
+// TestOpen_AllHomeVolumeReadsFailed_ReportsReadFailedNotGenericFallback pins
+// Q1 case (a): every one of the three home-volume reads fails at the
+// runtime level (exit 125) — the read-failed fallback string must be
+// emitted, and the generic "entrypoint exited before initialization
+// completed" string must never appear (it would misrepresent "we could not
+// look" as "we looked and found nothing").
+func TestOpen_AllHomeVolumeReadsFailed_ReportsReadFailedNotGenericFallback(t *testing.T) {
+	fakeDir := t.TempDir()
+	writeScriptedRuntimes(t, fakeDir)
+	assets := writeAssetFixture(t)
+	env, _, _ := openTestEnv(t, fakeDir, assets)
+
+	cmd := exec.Command(binaryPath, "open", "ch")
+	cmd.Env = append(env,
+		"FAKE_READY_EXIT=1",
+		"FAKE_INSPECT_STATE=exited 1",
+		"FAKE_STARTUP_ERROR_EXIT=125",
+		"FAKE_BOOT_LOG_EXIT=125",
+		"FAKE_STARTUP_MARKER_EXIT=125",
+	)
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected a startup failure exit 1, got %T %v\n%s", err, err, output)
+	}
+	if strings.Contains(string(output), "entrypoint exited before initialization completed") {
+		t.Errorf("expected the read-failed fallback, not the generic \"nothing found\" fallback (every read failed at the runtime level, not absent), got:\n%s", output)
+	}
+	if !strings.Contains(string(output), "read failed") {
+		t.Errorf("expected a distinct read-failed fallback string naming the read failure, got:\n%s", output)
+	}
+}
+
+// TestOpen_MixedHomeVolumeReadFailure_ReportsReadFailedNotGenericFallback
+// pins Q1 case (b): only the FIRST read (the agent-CLI-missing marker)
+// fails at the runtime level; the other two reads and the logs fallback are
+// legitimately absent/empty. Even one read-failed among the three must
+// still emit the read-failed fallback — the outcome isn't "upgraded" to
+// looking clean just because the other two reads came back absent.
+func TestOpen_MixedHomeVolumeReadFailure_ReportsReadFailedNotGenericFallback(t *testing.T) {
+	fakeDir := t.TempDir()
+	writeScriptedRuntimes(t, fakeDir)
+	assets := writeAssetFixture(t)
+	env, _, _ := openTestEnv(t, fakeDir, assets)
+
+	cmd := exec.Command(binaryPath, "open", "ch")
+	cmd.Env = append(env,
+		"FAKE_READY_EXIT=1",
+		"FAKE_INSPECT_STATE=exited 1",
+		"FAKE_STARTUP_ERROR_EXIT=125",
+		"FAKE_BOOT_LOG_EXIT=1",
+		"FAKE_STARTUP_MARKER_EXIT=1",
+	)
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected a startup failure exit 1, got %T %v\n%s", err, err, output)
+	}
+	if strings.Contains(string(output), "entrypoint exited before initialization completed") {
+		t.Errorf("expected the read-failed fallback even though only ONE of the three reads failed, got:\n%s", output)
+	}
+	if !strings.Contains(string(output), "read failed") {
+		t.Errorf("expected a distinct read-failed fallback string naming the read failure, got:\n%s", output)
+	}
+}
+
+// TestOpen_AllHomeVolumeReadsDefinitivelyAbsent_ReportsGenericFallback pins
+// Q1 case (c), the non-regression guard: when all three reads are
+// DEFINITIVELY absent (exit 1, "no such marker") and the logs fallback
+// yields nothing, the existing generic fallback string must still be
+// emitted verbatim — the #1163 change must not make every startup failure
+// report "read failed".
+func TestOpen_AllHomeVolumeReadsDefinitivelyAbsent_ReportsGenericFallback(t *testing.T) {
+	fakeDir := t.TempDir()
+	writeScriptedRuntimes(t, fakeDir)
+	assets := writeAssetFixture(t)
+	env, _, _ := openTestEnv(t, fakeDir, assets)
+
+	cmd := exec.Command(binaryPath, "open", "ch")
+	cmd.Env = append(env,
+		"FAKE_READY_EXIT=1",
+		"FAKE_INSPECT_STATE=exited 1",
+		"FAKE_STARTUP_ERROR_EXIT=1",
+		"FAKE_BOOT_LOG_EXIT=1",
+		"FAKE_STARTUP_MARKER_EXIT=1",
+	)
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected a startup failure exit 1, got %T %v\n%s", err, err, output)
+	}
+	if !strings.Contains(string(output), "entrypoint exited before initialization completed") {
+		t.Errorf("expected the generic fallback when every read is definitively absent and logs are empty, got:\n%s", output)
+	}
+	if strings.Contains(string(output), "read failed") {
+		t.Errorf("did not expect the read-failed fallback when every read was definitively absent, not failed, got:\n%s", output)
+	}
+}
+
+// TestOpen_AgentStartupErrorMarkerAllControlBytes_FallsThroughToBootLog pins
+// a #1163 security re-review regression: fix #2 made readHomeVolumeFile
+// return (homeVolumeReadOK, "") for a genuinely successful read whose
+// content sanitizes down to empty (e.g. a marker containing only stripped
+// control bytes), rather than misclassifying it as Absent. Before this fix,
+// startupFailureDetail's first tier matched a plain `case homeVolumeReadOK`
+// and returned immediately on that empty content, suppressing every
+// remaining tier (boot log, startup-failed, the logs fallback) down to a
+// bare error code with no detail — a container-controlled way to blind the
+// very diagnostics this ticket exists to make reliable. An all-control-byte
+// .cenci-agent-startup-error marker must fall through to the boot-log tier
+// exactly like a legitimately absent marker does, not short-circuit.
+func TestOpen_AgentStartupErrorMarkerAllControlBytes_FallsThroughToBootLog(t *testing.T) {
+	fakeDir := t.TempDir()
+	writeScriptedRuntimes(t, fakeDir)
+	assets := writeAssetFixture(t)
+	env, _, _ := openTestEnv(t, fakeDir, assets)
+
+	const bootLog = "boot log: mkdir /workspace/.cenci: permission denied"
+	cmd := exec.Command(binaryPath, "open", "ch")
+	cmd.Env = append(env,
+		"FAKE_READY_EXIT=1",
+		"FAKE_INSPECT_STATE=exited 1",
+		"FAKE_STARTUP_ERROR=\x1b\x1b\x1b",
+		"FAKE_BOOT_LOG="+bootLog,
+	)
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("expected a startup failure exit 1, got %T %v\n%s", err, err, output)
+	}
+	if !strings.Contains(string(output), bootLog) {
+		t.Errorf("expected an all-control-byte agent-CLI-missing marker to fall through to the boot-log tier instead of suppressing it, got:\n%s", output)
+	}
+	if strings.Contains(string(output), "CENCI-SANDBOX-START-001") {
+		t.Errorf("expected the OK-but-empty agent-CLI-missing marker to NOT short-circuit with its own code (no real detail was ever found there), got:\n%s", output)
+	}
+	if !strings.Contains(string(output), "CENCI-SANDBOX-START-002") {
+		t.Errorf("expected the generic-entrypoint code (the boot-log tier that should have fired), got:\n%s", output)
 	}
 }
 

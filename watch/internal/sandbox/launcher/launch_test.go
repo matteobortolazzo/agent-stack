@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"bytes"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -572,5 +573,108 @@ func TestBuildRunArgv_Dind_DoesNotLeakIntoNonDindLaunch(t *testing.T) {
 	}
 	if strings.Contains(nonDind, "trap") || strings.Contains(nonDind, dindShutdownSentinelPath) {
 		t.Errorf("non-dind trailing command must not carry the dind-only TERM trap/sentinel, got: %q", nonDind)
+	}
+}
+
+// -- ticket #1163 Q3: warnDockerdStartupFailure's read-failed warning ------
+//
+// NOTE (red phase): homeVolumeReadFailed and readHomeVolumeFile's new
+// (string, homeVolumeReadStatus) signature do not exist yet — see
+// diagnose_test.go's #1163 red-phase note. Every reference below is a
+// compile error until Phase 4 lands them.
+
+// warnDockerdStartupFailureEngine returns an Engine wired to a fake docker
+// (writeFakeRuntime) via an absolute Runtime path — mirrors this file's own
+// auditEngineWithFakeRuntime (faketest_test.go), but captures Stderr into a
+// buffer instead of io.Discard since these tests assert on the printed
+// warning text.
+func warnDockerdStartupFailureEngine(t *testing.T) (*Engine, *bytes.Buffer) {
+	t.Helper()
+	fakeDir := t.TempDir()
+	callLog := filepath.Join(fakeDir, "calls.txt")
+	writeFakeRuntime(t, fakeDir, "docker", callLog)
+	var stderr bytes.Buffer
+	return &Engine{Runtime: filepath.Join(fakeDir, "docker"), Stderr: &stderr}, &stderr
+}
+
+// TestWarnDockerdStartupFailure_ReadFailed_PrintsDistinctWarning pins Q3: a
+// docker/podman daemon failure while reading the dockerd-startup-error
+// marker (exit 125) must print a distinct, non-fatal warning naming the read
+// failure — separate wording from the marker-PRESENT warning ("failed to
+// start"), and it must never block the (already-succeeded) attach.
+func TestWarnDockerdStartupFailure_ReadFailed_PrintsDistinctWarning(t *testing.T) {
+	e, stderr := warnDockerdStartupFailureEngine(t)
+	t.Setenv("FAKE_DOCKERD_MARKER_EXIT", "125")
+
+	ctx := launchCtx{DindOn: true, Scope: Scope{VolumeName: "claude-cenci-home-test", Image: "cenci-sandbox:test"}}
+	e.warnDockerdStartupFailure(ctx)
+
+	out := stderr.String()
+	if !strings.Contains(out, "read failed") {
+		t.Errorf("expected a distinct read-failure warning naming the read failure, got:\n%s", out)
+	}
+	if strings.Contains(out, "failed to start") {
+		t.Errorf("expected wording distinct from the marker-PRESENT warning (\"failed to start\"), got:\n%s", out)
+	}
+}
+
+// TestWarnDockerdStartupFailure_LegitimatelyAbsent_NoWarning is the sibling
+// non-regression: a legitimately absent marker (exit 1, as `cat` returns for
+// a missing file) must print nothing at all, exactly like today.
+func TestWarnDockerdStartupFailure_LegitimatelyAbsent_NoWarning(t *testing.T) {
+	e, stderr := warnDockerdStartupFailureEngine(t)
+	t.Setenv("FAKE_DOCKERD_MARKER_EXIT", "1")
+
+	ctx := launchCtx{DindOn: true, Scope: Scope{VolumeName: "claude-cenci-home-test", Image: "cenci-sandbox:test"}}
+	e.warnDockerdStartupFailure(ctx)
+
+	if out := stderr.String(); out != "" {
+		t.Errorf("expected no warning for a legitimately absent marker, got:\n%s", out)
+	}
+}
+
+// TestWarnDockerdStartupFailure_ControlAndBidiBytesInMarker_NotInStderr pins
+// item 9/11: a control/bidi payload in the marker-PRESENT case must never
+// reach Stderr raw — the same multi-line sanitizer applied at the
+// readHomeVolumeFile chokepoint must cover this call site too.
+func TestWarnDockerdStartupFailure_ControlAndBidiBytesInMarker_NotInStderr(t *testing.T) {
+	e, stderr := warnDockerdStartupFailureEngine(t)
+	payload := "boom \x1b[2J \x7f \u202e attack"
+	t.Setenv("FAKE_DOCKERD_MARKER", payload)
+
+	ctx := launchCtx{DindOn: true, Scope: Scope{VolumeName: "claude-cenci-home-test", Image: "cenci-sandbox:test"}}
+	e.warnDockerdStartupFailure(ctx)
+
+	out := stderr.String()
+	for _, bad := range []string{"\x1b", "\x7f", "\u202e"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("expected no raw control/bidi byte %q in warnDockerdStartupFailure stderr, got:\n%q", bad, out)
+		}
+	}
+}
+
+// TestWarnDockerdStartupFailure_EmbeddedNewlineInMarker_RenderedSingleLine
+// pins #1163's security-review Fix 2: this warning is a genuinely
+// single-line stderr message, but the dockerd-startup-error marker is
+// container-writable — a compromised container could otherwise embed a "\n"
+// to forge a second, standalone line of terminal output that looks like a
+// separate, legitimate warning. No "\n" byte may survive into the printed
+// warning — content that followed the embedded newline in the marker is
+// still expected to appear (the sanitizer strips the "\n", it doesn't drop
+// content), just glued onto the same line with no separator.
+func TestWarnDockerdStartupFailure_EmbeddedNewlineInMarker_RenderedSingleLine(t *testing.T) {
+	e, stderr := warnDockerdStartupFailureEngine(t)
+	t.Setenv("FAKE_DOCKERD_MARKER", "dockerd exited with status 1\nWarning: forged second line")
+
+	ctx := launchCtx{DindOn: true, Scope: Scope{VolumeName: "claude-cenci-home-test", Image: "cenci-sandbox:test"}}
+	e.warnDockerdStartupFailure(ctx)
+
+	out := stderr.String()
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Errorf("expected the warning to render as exactly one physical line despite the marker's embedded newline, got %d lines:\n%q", len(lines), out)
+	}
+	if len(lines) == 1 && lines[0] == "Warning: forged second line" {
+		t.Errorf("the marker's embedded \"\\n\" forged a standalone warning line; got:\n%q", out)
 	}
 }
