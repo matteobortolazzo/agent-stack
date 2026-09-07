@@ -2252,6 +2252,14 @@ verbatim, if set), then `$XDG_STATE_HOME/cenci/run` (default
 `~/.local/state/cenci/run`), and only when that state tier is itself
 unresolvable does it fall back to `/tmp/cenci-<uid>/cenci`. Run `cenci
 socket-dir` to print the resolved path for the current environment.
+Resolution now hard-errors (no silent fall-through) when the state root or
+the tmp base is a symlink, a non-directory, foreign-owned, or
+group/other-writable — a pre-planted directory there is treated as hostile,
+not merely unusable. `CENCI_SOCKET_DIR` bypasses the tier chain, not the
+hardening: point it at a real (non-symlink), self-owned directory at mode
+`0700`. If you deliberately symlink `$XDG_STATE_HOME/cenci` (e.g. a dotfile
+manager), set `CENCI_SOCKET_DIR` to a real directory instead — pointing it at
+that same symlink still hard-errors.
 
 ```bash
 cenci daemon stop      # SIGTERM, then SIGKILL if still alive after a few seconds; exits 0 whether or not anything was running

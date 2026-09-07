@@ -124,7 +124,7 @@ func runDaemonStart(args []string) {
 	started := false
 	onStarted := func() {
 		started = true
-		if err := daemon.WritePIDFile(pidPath); err != nil && cfg.Verbose {
+		if err := daemon.WritePIDFile(pidPath); err != nil {
 			logger.Log(logging.SeverityWarn, "", fmt.Sprintf("warning: could not write pid file %s: %v", pidPath, err))
 		}
 	}

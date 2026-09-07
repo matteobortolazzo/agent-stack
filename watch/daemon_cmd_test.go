@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -190,6 +192,85 @@ func TestDaemonStart_SocketDirResolutionError_LogsWarning(t *testing.T) {
 	out := stopAndCollectStderr(t, d)
 	if !strings.Contains(out, "could not evaluate socket-dir resolution") {
 		t.Errorf("expected a logged warning naming the socket-dir resolution failure, got stderr:\n%s", out)
+	}
+}
+
+// syncBuffer is a mutex-guarded io.Writer, safe to poll (String()) from the
+// test goroutine while the subprocess's stderr-copying goroutine writes into
+// it concurrently — a plain bytes.Buffer is not safe for that concurrent
+// access, unlike stopAndCollectStderr's post-Wait()-only reads above.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestDaemonStart_PIDFileWriteFailure_LogsUnconditionally is the #1147
+// silent-failure-hunter fix: WritePIDFile's new security-meaningful failure
+// modes (a plant at the PID path) must be logged even without -v/--verbose —
+// previously the log call was gated on cfg.Verbose, so a default (non-verbose)
+// daemon start silently proceeded with no PID file and no indication a plant
+// was rejected. A directory planted at the PID path stands in for the
+// plant class WritePIDFile now rejects (symlink/FIFO/non-regular file),
+// without racing a real daemon startup against a symlink/FIFO setup.
+func TestDaemonStart_PIDFileWriteFailure_LogsUnconditionally(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatalf("hardening CENCI_SOCKET_DIR %q: %v", dir, err)
+	}
+	t.Setenv("CENCI_SOCKET_DIR", dir)
+
+	pidPath := filepath.Join(dir, "cenci.pid")
+	if err := os.Mkdir(pidPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr syncBuffer
+	cmd := exec.Command(binaryPath, "daemon", "start") // deliberately no -v
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start 'daemon start': %v", err)
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-done
+	})
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(stderr.String(), "could not write pid file") {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("SIGTERM: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not exit after SIGTERM")
+	}
+
+	out := stderr.String()
+	if !strings.Contains(out, "could not write pid file") {
+		t.Fatalf("expected an unconditional (no -v) warning naming the pid file write failure, got stderr:\n%s", out)
+	}
+	if !strings.Contains(out, pidPath) {
+		t.Errorf("stderr = %q, want it to name the pid path %q", out, pidPath)
 	}
 }
 
