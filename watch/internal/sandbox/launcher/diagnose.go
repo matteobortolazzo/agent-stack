@@ -63,33 +63,55 @@ func severityForCode(code errcode.Code) Severity {
 	}
 }
 
+// indentContinuationLines indents every line after the first in s with a
+// distinct "  | " gutter (#1163 security review). renderFinding's Message
+// can come from container-controlled multi-line content (e.g. a boot log
+// via startupFailureDetail) — printed at column 0, lines 2..N of that
+// content would otherwise be visually indistinguishable inside the findings
+// list from a genuine, separate "[severity] CENCI-...: ..." finding line,
+// letting a malicious container forge fake findings by shaping its content.
+// The gutter deliberately does NOT reuse the hint-rendering code's own
+// "  - " prefix a few lines below: a plain two-space indent would let a
+// continuation line starting with "- " render identically to a genuine
+// recovery hint instead, just moving the forgery target rather than closing
+// it. A single-line s is returned unchanged.
+func indentContinuationLines(s string) string {
+	return strings.ReplaceAll(s, "\n", "\n  | ")
+}
+
 // renderFinding renders f as a report block: a "[severity] message" header,
 // followed by the code (if any) and its registered recovery hints — reused
 // verbatim from errcode.Lookup(f.Code).Hints so the diagnose output and the
 // errcode registry never drift apart. A finding with no Code (Code == "")
 // prints only the severity and message; it never fabricates a code or hints
-// that were never attached.
+// that were never attached. A multi-line f.Message has its continuation
+// lines indented (indentContinuationLines) so they read as part of this one
+// finding, not as standalone report lines.
 func renderFinding(f finding) string {
 	var b strings.Builder
+	message := indentContinuationLines(f.Message)
 	if f.Code != "" {
-		fmt.Fprintf(&b, "[%s] %s: %s\n", f.Severity, f.Code, f.Message)
+		fmt.Fprintf(&b, "[%s] %s: %s\n", f.Severity, f.Code, message)
 		if entry, ok := errcode.Lookup(f.Code); ok {
 			for _, hint := range entry.Hints {
 				fmt.Fprintf(&b, "  - %s\n", hint)
 			}
 		}
 	} else {
-		fmt.Fprintf(&b, "[%s] %s\n", f.Severity, f.Message)
+		fmt.Fprintf(&b, "[%s] %s\n", f.Severity, message)
 	}
 	return b.String()
 }
 
-// versionOrUnknown is the shared "unknown" fallback every best-effort version
-// read (image base-version, plugin-manifest version) funnels through: a
-// failed read (ok == false) or a successful-but-empty read (ok == true,
-// content == "") both surface as "unknown" rather than a blank string.
-// Whitespace in a real, non-empty content value is preserved verbatim — the
-// caller is responsible for trimming, not this fallback.
+// versionOrUnknown is the shared "unknown" fallback a best-effort (value, ok
+// bool) version read funnels through — today just imageBaseVersion (the
+// plugin-manifest version has its own three-state display helper,
+// pluginManifestVersionDisplay, since #1163 needs to distinguish a genuine
+// read failure from a legitimately absent manifest, which a plain ok bool
+// cannot represent): a failed read (ok == false) or a successful-but-empty
+// read (ok == true, content == "") both surface as "unknown" rather than a
+// blank string. Whitespace in a real, non-empty content value is preserved
+// verbatim — the caller is responsible for trimming, not this fallback.
 func versionOrUnknown(content string, ok bool) string {
 	if !ok || content == "" {
 		return "unknown"
@@ -134,19 +156,60 @@ func marketplaceManifestPath(agent string) string {
 // manifest from scope's home volume via the same short-lived-container
 // pattern as startupFailureDetail's home-volume reads (the workload container
 // may already be gone). An agent with no manifest path (opencode) reports a
-// clean read failure — same as any other unreadable path — rather than
-// attempting a read with an empty path argument.
-func (e *Engine) pluginManifestVersion(scope Scope, agent string) (string, bool) {
+// clean homeVolumeReadAbsent — there is nothing to read, so "the read
+// failed" would be a wrong claim — rather than attempting a read with an
+// empty path argument.
+//
+// readHomeVolumeFile's chokepoint sanitizes with the multi-line/newline-
+// preserving variant (needed by other consumers of that chokepoint, e.g.
+// startupFailureDetail's boot-log rendering), but manifest.json's content is
+// rendered into Diagnose's single-line "Plugin manifest version: %s" field —
+// a container-writable file containing embedded "\n"s could otherwise forge
+// extra, legitimate-looking report lines. A successful read is re-sanitized
+// with the single-line/head-keeping variant before it's returned, so no "\n"
+// byte ever reaches that one-line field (#1163 security review).
+func (e *Engine) pluginManifestVersion(scope Scope, agent string) (string, homeVolumeReadStatus) {
 	path := marketplaceManifestPath(agent)
 	if path == "" {
-		return "", false
+		return "", homeVolumeReadAbsent
 	}
-	return e.readHomeVolumeFile(scope, path)
+	content, status := e.readHomeVolumeFile(scope, path)
+	if status == homeVolumeReadOK {
+		content = sanitizeEventDeliveryMessage(content)
+	}
+	return content, status
+}
+
+// pluginManifestVersionDisplay renders pluginManifestVersion's three-state
+// result the way Diagnose's "Plugin manifest version:" line needs (#1163):
+// a successful read's content verbatim, a legitimately absent manifest (or
+// opencode's clean short-circuit) as the plain "unknown", and a genuine read
+// failure as the distinct "unknown (read failed)" — so an operator isn't
+// told "we looked and found nothing" when the truth is "we could not look".
+func pluginManifestVersionDisplay(content string, status homeVolumeReadStatus) string {
+	switch status {
+	case homeVolumeReadOK:
+		if content == "" {
+			return "unknown"
+		}
+		return content
+	case homeVolumeReadFailed:
+		return "unknown (read failed)"
+	default:
+		return "unknown"
+	}
 }
 
 // imageBaseVersion best-effort reads image's baked cenci.base-version label.
 // It reuses imageCurrent's combined agent-cli|base-version format string so a
-// single `image inspect` invocation serves both call sites identically.
+// single `image inspect` invocation serves both call sites identically. The
+// label's value comes from a per-repo .cenci/Dockerfile — the same
+// untrusted-repo-content boundary as the other sanitized fields — and is
+// rendered into Diagnose's single-line "Image base version: %s" field, so it
+// is sanitized with the single-line/head-keeping sanitizer before it's
+// returned (#1163 security review). Emptiness is decided on the raw,
+// unsanitized value first, mirroring readHomeVolumeFile's own ordering, so a
+// genuinely present-but-all-control-byte label can't misreport as absent.
 func (e *Engine) imageBaseVersion(image string) (string, bool) {
 	out, err := exec.Command(e.Runtime, "image", "inspect", "--format",
 		`{{ index .Config.Labels "`+imageAgentLifecycleLabel+`" }}|{{ index .Config.Labels "`+imageBaseVersionLabel+`" }}`, image).Output()
@@ -158,16 +221,23 @@ func (e *Engine) imageBaseVersion(image string) (string, bool) {
 		return "", false
 	}
 	v := parts[1]
-	return v, v != ""
+	if v == "" {
+		return "", false
+	}
+	return sanitizeEventDeliveryMessage(v), true
 }
 
-// containerLogsTail best-effort reads the container's last n log lines.
+// containerLogsTail best-effort reads the container's last n log lines,
+// sanitized with the multi-line sanitizer (#1163) — the container fully
+// controls this content, and it can be many lines, so it goes through the
+// same newline-preserving, tail-keeping sanitizer as the home-volume
+// chokepoint rather than the single-line one.
 func (e *Engine) containerLogsTail(name string, n int) (string, bool) {
 	out, err := exec.Command(e.Runtime, "logs", "--tail", strconv.Itoa(n), name).CombinedOutput()
 	if err != nil {
 		return "", false
 	}
-	trimmed := strings.TrimSpace(string(out))
+	trimmed := sanitizeHomeVolumeContent(strings.TrimSpace(string(out)))
 	return trimmed, trimmed != ""
 }
 
@@ -183,33 +253,92 @@ func (e *Engine) inspectMounts(name string) (string, bool) {
 	return trimmed, trimmed != ""
 }
 
+// dindSessionState is the tri-state result of probing whether scope's dind
+// storage volume was ever created (isDindSession, #1163). It replaces an
+// earlier boolean probe built on `volume inspect`: podman exits 125 for
+// `volume inspect` on a legitimately-absent volume — indistinguishable from
+// a genuine runtime failure — which would have misclassified every non-dind
+// podman session as "runtime failed" (podman is the first-detected
+// runtime). `volume ls` instead returns a plain name list that this probe
+// matches in Go, so a `volume ls` failure is unambiguously the runtime's own
+// fault, never confused with "volume legitimately absent".
+type dindSessionState int
+
+const (
+	// dindSessionAbsent means the dind volume was never created: this
+	// session was never launched with --dind (or scope.DindVolumeName is
+	// empty — legacy/ScopeForContainer scopes never carry one, so there is
+	// nothing to probe at all).
+	dindSessionAbsent dindSessionState = iota
+	// dindSessionPresent means `volume ls` listed scope.DindVolumeName: a
+	// genuine dind session.
+	dindSessionPresent
+	// dindSessionIndeterminate means the `volume ls` probe itself failed
+	// (e.g. the runtime daemon is unreachable) — whether this is a dind
+	// session could not be determined at all.
+	dindSessionIndeterminate
+)
+
 // isDindSession probes whether scope's dind storage volume was ever created
-// (`volume inspect scope.DindVolumeName`) — the same signal a genuine
-// --dind launch would have left behind. A non-zero exit means the volume
-// was never created, i.e. this session was never launched with --dind.
-func (e *Engine) isDindSession(scope Scope) bool {
-	return exec.Command(e.Runtime, "volume", "inspect", scope.DindVolumeName).Run() == nil
+// — the same signal a genuine --dind launch would have left behind — via the
+// existing volumeExists helper (`volume ls --format {{.Name}}` + name match,
+// engine.go). An empty scope.DindVolumeName short-circuits to
+// dindSessionAbsent with no probe at all.
+func (e *Engine) isDindSession(scope Scope) dindSessionState {
+	if scope.DindVolumeName == "" {
+		return dindSessionAbsent
+	}
+	exists, err := e.volumeExists(scope.DindVolumeName)
+	if err != nil {
+		return dindSessionIndeterminate
+	}
+	if exists {
+		return dindSessionPresent
+	}
+	return dindSessionAbsent
 }
 
 // nestedDockerFinding implements #630's Q3: Diagnose must always print a
 // "Nested Docker:" line (the package's #572 failure-visibility convention —
 // never partial silence). It probes dind-session-ness via isDindSession,
-// then reads the dockerd-startup-error marker (present only for a genuine
-// dind session — that path is meaningless for a non-dind one) and returns
-// the display line plus an optional Degraded finding when the marker is
-// present.
+// then — only for a genuine dind session — reads the dockerd-startup-error
+// marker and returns the display line plus an optional finding: Degraded
+// when the marker is present, or an explicit Warning (#1163) when either the
+// dind-session probe itself or the marker read itself failed, so "we could
+// not look" is never silently reported as "no failure recorded". A
+// successful marker read is re-sanitized with the single-line/head-keeping
+// sanitizer (on top of the chokepoint's multi-line one) before it's
+// rendered: both the returned line and finding.Message are genuinely
+// single-line report fields, and the marker is container-writable — an
+// embedded "\n" could otherwise forge extra, legitimate-looking report
+// lines (#1163 security review).
 func (e *Engine) nestedDockerFinding(scope Scope) (line string, f *finding) {
-	if !e.isDindSession(scope) {
+	switch e.isDindSession(scope) {
+	case dindSessionAbsent:
 		return "not a dind session", nil
+	case dindSessionIndeterminate:
+		return "could not determine (the dind-volume probe failed)", &finding{
+			Message:  "could not determine whether this is a dind session: the dind-volume probe (`volume ls`) failed",
+			Severity: SeverityWarning,
+		}
 	}
-	content, ok := e.readHomeVolumeFile(scope, dockerdFailureMarkerPath)
-	if !ok {
+
+	content, status := e.readHomeVolumeFile(scope, dockerdFailureMarkerPath)
+	switch status {
+	case homeVolumeReadOK:
+		sanitized := sanitizeEventDeliveryMessage(content)
+		return sanitized, &finding{
+			Message:  sanitized,
+			Code:     errcode.SandboxDindStartupFailure,
+			Severity: severityForCode(errcode.SandboxDindStartupFailure),
+		}
+	case homeVolumeReadFailed:
+		return "could not be read (the dockerd startup marker read failed)", &finding{
+			Message:  "the dockerd startup marker could not be read",
+			Severity: SeverityWarning,
+		}
+	default: // homeVolumeReadAbsent
 		return "no failure recorded", nil
-	}
-	return content, &finding{
-		Message:  content,
-		Code:     errcode.SandboxDindStartupFailure,
-		Severity: severityForCode(errcode.SandboxDindStartupFailure),
 	}
 }
 
@@ -220,36 +349,102 @@ func (e *Engine) nestedDockerFinding(scope Scope) (line string, f *finding) {
 // validated rather than trusted verbatim (#1094).
 const maxEventDeliveryMessageLen = 2048
 
-// sanitizeEventDeliveryMessage strips non-printable runes and bounds the
-// length of an undelivered-events marker's message (or code) field before it
-// is rendered, since the marker crosses the container->host seam (#1094).
-// unicode.IsPrint excludes not just ASCII C0 control bytes and DEL, but also
-// the C1 range (U+0080-U+009F, notably U+009B CSI and U+009D OSC, which some
-// terminals still act on) and Unicode bidi/format characters (e.g. U+202E
-// RLO, U+200B, U+2066-U+2069) that could otherwise spoof or manipulate
-// terminal output when a compromised/tampered container writes a crafted
-// field into the marker — a raw "< 0x20 || == 0x7f" predicate misses all of
-// those. The length cap truncates on a rune boundary (walking back from the
-// byte cutoff via utf8.RuneStart, the same technique
-// internal/babysit/automerge.go's sanitizeDetail uses) so a multi-byte UTF-8
-// character straddling the cutoff is never split mid-encoding.
-func sanitizeEventDeliveryMessage(s string) string {
+// maxHomeVolumeContentLen bounds the length of home-volume-read content
+// (startup markers, boot logs, the dockerd/events markers) before it is
+// rendered (#1163) — much larger than maxEventDeliveryMessageLen since this
+// content is legitimately multi-line (e.g. a 50-line boot log), unlike the
+// single-line event-delivery message field.
+const maxHomeVolumeContentLen = 8192
+
+// homeVolumeTruncationMarker is prepended (followed by a newline) to
+// sanitizeHomeVolumeContent's output when truncation occurs — visible so an
+// operator reading the report knows the content was cut, distinct from
+// content that never had more to show.
+const homeVolumeTruncationMarker = "[... truncated, showing most recent content ...]\n"
+
+// sanitizeText is the shared core sanitizeEventDeliveryMessage and
+// sanitizeHomeVolumeContent both build on (#1163). It strips non-printable
+// runes — unicode.IsPrint excludes not just ASCII C0 control bytes and DEL,
+// but also the C1 range (U+0080-U+009F, notably U+009B CSI and U+009D OSC,
+// which some terminals still act on) and Unicode bidi/format characters
+// (e.g. U+202E RLO, U+200B, U+2066-U+2069) that could otherwise spoof or
+// manipulate terminal output when a compromised/tampered container writes a
+// crafted field — then bounds the result to maxLen bytes on a rune-safe
+// boundary.
+//
+// allowNewlines preserves "\n"/"\t" verbatim instead of stripping them along
+// with every other non-printable rune — multi-line content like a boot log
+// must stay multi-line. keepTail selects both the truncation direction and
+// marker placement:
+//
+//   - false (sanitizeEventDeliveryMessage's shape): keeps the HEAD — cut at
+//     maxLen-len(marker), walk BACK via utf8.RuneStart, marker appended at
+//     the end. Called with an empty marker, so behavior stays byte-identical
+//     to before #1163.
+//   - true (sanitizeHomeVolumeContent's shape): keeps the TAIL — cut at
+//     len(out)-(maxLen-len(marker)), walk FORWARD to the next
+//     utf8.RuneStart, marker PREPENDED followed by a newline. Head-keeping
+//     would be wrong here: startupFailureDetail calls lastLines(content, 50)
+//     AFTER this chokepoint, so head-keeping would silently return the head
+//     of an already-truncated window instead of the true tail.
+//
+// marker's own bytes come out of the length budget in both directions, so
+// the returned string's length is always <= maxLen.
+func sanitizeText(s string, allowNewlines bool, maxLen int, keepTail bool, marker string) string {
 	var b strings.Builder
 	for _, r := range s {
+		if allowNewlines && (r == '\n' || r == '\t') {
+			b.WriteRune(r)
+			continue
+		}
 		if !unicode.IsPrint(r) {
 			continue
 		}
 		b.WriteRune(r)
 	}
 	out := b.String()
-	if len(out) > maxEventDeliveryMessageLen {
-		cut := maxEventDeliveryMessageLen
-		for cut > 0 && !utf8.RuneStart(out[cut]) {
-			cut--
-		}
-		out = out[:cut]
+	if len(out) <= maxLen {
+		return out
 	}
-	return out
+
+	// budget clamps to [0, maxLen]; combined with the len(out) > maxLen
+	// guard above, cut always lands within [0, len(out)] in both branches
+	// below, so no further bounds clamping is needed.
+	budget := maxLen - len(marker)
+	if budget < 0 {
+		budget = 0
+	}
+	if keepTail {
+		cut := len(out) - budget
+		for cut < len(out) && !utf8.RuneStart(out[cut]) {
+			cut++
+		}
+		return marker + out[cut:]
+	}
+
+	cut := budget
+	for cut > 0 && !utf8.RuneStart(out[cut]) {
+		cut--
+	}
+	return out[:cut] + marker
+}
+
+// sanitizeEventDeliveryMessage strips non-printable runes and bounds the
+// length of an undelivered-events marker's message (or code) field before it
+// is rendered, since the marker crosses the container->host seam (#1094).
+// Head-keeping, no truncation marker — unchanged behavior from before #1163
+// generalized this into sanitizeText's shared core.
+func sanitizeEventDeliveryMessage(s string) string {
+	return sanitizeText(s, false, maxEventDeliveryMessageLen, false, "")
+}
+
+// sanitizeHomeVolumeContent sanitizes content read from a home-volume marker
+// or log tail before it is rendered (#1163): preserves "\n"/"\t" (this
+// content is legitimately multi-line), tail-keeping truncation with a
+// visible marker at the front — see sanitizeText's doc comment for the full
+// rationale.
+func sanitizeHomeVolumeContent(s string) string {
+	return sanitizeText(s, true, maxHomeVolumeContentLen, true, homeVolumeTruncationMarker)
 }
 
 // eventDeliveryFinding implements #1122's always-on "Event delivery:" line,
@@ -262,8 +457,14 @@ func sanitizeEventDeliveryMessage(s string) string {
 // (never silently omitted, #572) rather than a code/severity that was never
 // actually attached.
 func (e *Engine) eventDeliveryFinding(scope Scope) (line string, f *finding) {
-	content, ok := e.readHomeVolumeFile(scope, daemon.UndeliveredEventsMarkerPath)
-	if !ok {
+	content, status := e.readHomeVolumeFile(scope, daemon.UndeliveredEventsMarkerPath)
+	switch status {
+	case homeVolumeReadFailed:
+		return "could not be read (the undelivered-events marker read failed)", &finding{
+			Message:  "the undelivered-events marker could not be read",
+			Severity: SeverityWarning,
+		}
+	case homeVolumeReadAbsent:
 		return "no failure recorded", nil
 	}
 	m, err := daemon.ParseUndeliveredEventsMarker([]byte(content))
@@ -509,10 +710,16 @@ func (e *Engine) Diagnose(scope Scope) error {
 		})
 	}
 
-	pluginVersion, pluginOK := e.pluginManifestVersion(scope, agent)
-	pluginDisplay := versionOrUnknown(pluginVersion, pluginOK)
+	pluginVersion, pluginStatus := e.pluginManifestVersion(scope, agent)
+	pluginDisplay := pluginManifestVersionDisplay(pluginVersion, pluginStatus)
 	_, _ = fmt.Fprintf(e.Stdout, "Plugin manifest version: %s\n", pluginDisplay)
-	if pluginDisplay == "unknown" {
+	switch pluginStatus {
+	case homeVolumeReadFailed:
+		findings = append(findings, finding{
+			Message:  "plugin manifest version could not be read (the read failed)",
+			Severity: SeverityWarning,
+		})
+	case homeVolumeReadAbsent:
 		findings = append(findings, finding{
 			Message:  "plugin manifest version could not be determined",
 			Severity: SeverityWarning,

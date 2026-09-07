@@ -84,16 +84,16 @@ import (
 //	                     container-status probe, #630); defaults to
 //	                     "running 0", mirroring sandbox_open_test.go's
 //	                     writeScriptedRuntime default.
-//	FAKE_VOLUME_INSPECT_EXIT → `volume inspect <name>` exit code (default 0 =
-//	                     the volume exists); Diagnose's dind-session probe
-//	                     (#630) treats a non-zero exit as "not a dind
-//	                     session" (scope.DindVolumeName was never created).
 //	FAKE_DOCKERD_MARKER → content returned by the short-lived
 //	                     `run --entrypoint /bin/cat ... .cenci-dockerd-
 //	                     startup-error` home-volume read (#630's dind
 //	                     failure marker); unset/empty simulates "no failure
 //	                     recorded". FAKE_DOCKERD_MARKER_EXIT (default 0) is
-//	                     that same read's exit code.
+//	                     that same read's exit code — set it to 125/126/127
+//	                     (#1163) to script readHomeVolumeFile's read-failed
+//	                     classification for this marker; any other non-zero
+//	                     exit (e.g. 1) scripts the legitimately-absent
+//	                     classification instead.
 //	FAKE_EVENTS_MARKER  → content returned by the short-lived
 //	                     `run --entrypoint /bin/cat ... .cenci-events-
 //	                     undelivered` home-volume read (#1122's dropped-
@@ -101,7 +101,17 @@ import (
 //	                     internal/daemon and surfaced by diagnose.go's
 //	                     "Event delivery:" section); unset/empty simulates
 //	                     "no failure recorded". FAKE_EVENTS_MARKER_EXIT
-//	                     (default 0) is that same read's exit code.
+//	                     (default 0) is that same read's exit code — same
+//	                     125/126/127-vs-other-nonzero scripting convention as
+//	                     FAKE_DOCKERD_MARKER_EXIT above (#1163).
+//	FAKE_LOGS           — `logs --tail <n> <container>` stdout
+//	                     (containerLogsTail's best-effort probe, surfaced by
+//	                     Diagnose's "Recent logs (tail):" section); unset/
+//	                     empty simulates no logs. FAKE_LOGS_EXIT (default 0)
+//	                     is that same read's exit code. Must stay
+//	                     byte-parallel with sandbox_open_test.go's
+//	                     writeScriptedRuntime FAKE_LOGS var (#493
+//	                     keep-in-sync note).
 //	FAKE_OBSERVED_POSTURE → `inspect --format ...` stdout for ticket #627's
 //	                     combined observed-inspect probe (Audit's
 //	                     running-container derivation: image reference,
@@ -259,7 +269,6 @@ ps) fv PS ""; exit "$(fe PS)" ;;
 volume)
   case "$2" in
   ls) fv VOLUMES ""; exit "$(fe VOLUME_LS)" ;;
-  inspect) exit "$(fe VOLUME_INSPECT)" ;;
   esac
   ;;
 info) fv INFO_RUNTIMES "{}"; exit "$(fe INFO)" ;;
@@ -273,6 +282,7 @@ run)
     ;;
   esac
   ;;
+logs) fv LOGS ""; exit "$(fe LOGS)" ;;
 inspect)
   case "$*" in
   *'.HostConfig.NetworkMode'*) fvb OBSERVED_POSTURE "cenci-sandbox:latest|bridge|runc||\n\n"; exit "$(fe OBSERVED_POSTURE)" ;;

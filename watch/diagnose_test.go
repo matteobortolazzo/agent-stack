@@ -31,8 +31,13 @@ import (
 // reachable" cases, false leaves an empty socket dir (no socket file at
 // all) for the "event socket missing" case. CENCI_SOCKET_DIR's tier-1
 // override is verbatim (no appended "cenci/" segment, #1142), so socketDir
-// IS the resolved socket dir directly.
-func diagEnv(t *testing.T, fakeDir, assets string, withSocket bool) (env []string, home string) {
+// IS the resolved socket dir directly. extraVolumes (#1163) are appended to
+// the default FAKE_VOLUMES line so a git-repo-scoped test can additionally
+// list its computed DindVolumeName — required for any subprocess test that
+// reaches the dockerd-marker path via isDindSession's `volume ls` probe;
+// omit it entirely for the (legacy-scope, most common) tests that don't
+// care.
+func diagEnv(t *testing.T, fakeDir, assets string, withSocket bool, extraVolumes ...string) (env []string, home string) {
 	t.Helper()
 	home = t.TempDir()
 	socketDir := t.TempDir()
@@ -47,12 +52,16 @@ func diagEnv(t *testing.T, fakeDir, assets string, withSocket bool) (env []strin
 		}
 		t.Cleanup(func() { _ = l.Close() })
 	}
+	volumes := "cenci-agent-cli-claude\ncenci-agent-cli-codex\n"
+	for _, v := range extraVolumes {
+		volumes += v + "\n"
+	}
 	env = append(os.Environ(),
 		"PATH="+fakeDir+":/usr/bin:/bin",
 		"HOME="+home,
 		"CENCI_SANDBOX_ASSETS="+assets,
 		"CENCI_SOCKET_DIR="+socketDir,
-		"FAKE_VOLUMES=cenci-agent-cli-claude\ncenci-agent-cli-codex\n",
+		"FAKE_VOLUMES="+volumes,
 		"FAKE_IMAGE_BASE_VERSION="+tag,
 	)
 	return env, home
@@ -350,5 +359,110 @@ func TestDiagnose_PositionalArgumentRetired_Exits2WithNewGrammar(t *testing.T) {
 	}
 	if !strings.Contains(out, "--name") {
 		t.Errorf("expected the usage error to show the new --name grammar, got:\n%s", out)
+	}
+}
+
+// -- ticket #1163: end-to-end control-payload sanitization + read-failed --
+// -- classification against the real cenci binary --------------------------
+
+// TestDiagnose_NestedDocker_DindRepoScope_ControlAndBidiBytes_SanitizedInOutput
+// is an end-to-end proof (against the real built binary, not just the
+// launcher-package unit tests) that a control/bidi payload in the
+// dockerd-startup-error marker never reaches stdout/stderr raw. It runs
+// `cenci diagnose` from inside a git repo (so ComputeScope populates a real
+// DindVolumeName) and lists that exact volume name via diagEnv's
+// extraVolumes so isDindSession's `volume ls` probe reports the session as a
+// genuine dind session.
+func TestDiagnose_NestedDocker_DindRepoScope_ControlAndBidiBytes_SanitizedInOutput(t *testing.T) {
+	repoRoot, slug := dindRepoEnv(t, false)
+	dindVolume := "claude-cenci-dind-" + slug
+
+	fakeDir := t.TempDir()
+	writeScriptedRuntimes(t, fakeDir)
+	assets := writeAssetFixture(t)
+	env, _ := diagEnv(t, fakeDir, assets, true, dindVolume)
+
+	payload := "boom \x1b[2J \x7f \u202e attack"
+	cmd := exec.Command(binaryPath, "diagnose")
+	cmd.Env = append(env, "FAKE_DOCKERD_MARKER="+payload)
+	cmd.Dir = repoRoot
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("diagnose (dind repo scope, control-payload marker): %v\n%s", err, output)
+	}
+
+	out := string(output)
+	for _, bad := range []string{"\x1b", "\x7f", "\u202e"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("expected no raw control/bidi byte %q in diagnose output, got:\n%q", bad, out)
+		}
+	}
+}
+
+// TestDiagnose_PluginManifest_ReadFailed pins #1163 Q4 end-to-end: a
+// docker/podman daemon failure while reading the plugin manifest (exit 125)
+// must surface as "unknown (read failed)" — distinct from the plain
+// "unknown" TestDiagnose_ReportsImageBaseVersionAndUnknownPluginVersionOnReadFailure
+// already pins for a legitimately absent manifest.
+func TestDiagnose_PluginManifest_ReadFailed(t *testing.T) {
+	fakeDir := t.TempDir()
+	writeScriptedRuntimes(t, fakeDir)
+	assets := writeAssetFixture(t)
+	env, _ := diagEnv(t, fakeDir, assets, true)
+
+	cmd := exec.Command(binaryPath, "diagnose", "--name", "mysession")
+	cmd.Env = append(env, "FAKE_PLUGIN_MANIFEST_EXIT=125")
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("diagnose (plugin manifest read failed): %v\n%s", err, output)
+	}
+	out := string(output)
+	if !strings.Contains(out, "unknown (read failed)") {
+		t.Errorf("expected the plugin manifest version to report \"unknown (read failed)\" when the read fails at the runtime level, got:\n%s", out)
+	}
+}
+
+// TestDiagnose_PluginManifest_EmbeddedNewline_RenderedSingleLine pins
+// #1163's security-review Fix 2: "Plugin manifest version: %s" is a
+// genuinely single-line report field, but marketplace.json is
+// container-writable — a compromised container could otherwise embed a
+// "\n" to forge a second, legitimate-looking report line. The manifest
+// content must be re-sanitized with the single-line/head-keeping sanitizer
+// (on top of the chokepoint's multi-line one) before it's rendered, so no
+// "\n" byte survives into the printed field.
+func TestDiagnose_PluginManifest_EmbeddedNewline_RenderedSingleLine(t *testing.T) {
+	fakeDir := t.TempDir()
+	writeScriptedRuntimes(t, fakeDir)
+	assets := writeAssetFixture(t)
+	env, _ := diagEnv(t, fakeDir, assets, true)
+
+	const forgedLine = "Nested Docker: no failure recorded"
+	manifest := `{"version":"3.4.5"}` + "\n" + forgedLine
+	cmd := exec.Command(binaryPath, "diagnose", "--name", "mysession")
+	cmd.Env = append(env, "FAKE_PLUGIN_MANIFEST="+manifest)
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("diagnose (plugin manifest embedded newline): %v\n%s", err, output)
+	}
+	out := string(output)
+	manifestLines := 0
+	for _, line := range strings.Split(out, "\n") {
+		if line == forgedLine {
+			t.Errorf("the manifest's embedded \"\\n\" forged a standalone %q report line; got full output:\n%s", forgedLine, out)
+		}
+		if strings.HasPrefix(line, "Plugin manifest version:") {
+			manifestLines++
+		}
+	}
+	// Exactly one PHYSICAL LINE may start with "Plugin manifest version:" —
+	// the forged text is expected to still appear, glued onto that same
+	// line with no separator (the sanitizer strips the "\n", it doesn't
+	// drop content), so a plain substring count of "Nested Docker:"
+	// wouldn't be the right assertion here (it would also match the forged
+	// text glued onto this line).
+	if manifestLines != 1 {
+		t.Errorf("expected exactly one line starting with \"Plugin manifest version:\" even with an embedded newline in the manifest, got %d in:\n%s", manifestLines, out)
 	}
 }
