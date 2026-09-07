@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -165,6 +166,29 @@ func TestNotifyParsesSessionEndReasonFromStdin(t *testing.T) {
 				t.Fatal("timed out waiting for notify event")
 			}
 		})
+	}
+}
+
+// TestNotifyHostBranch_UnreachableSocketExitsZeroWithEmptyStdout covers
+// ticket #1122's AC #8 regression requirement: on the host (CENCI_SANDBOX
+// unset/cleared), notify's exit-0/empty-stdout contract for an unreachable
+// event socket must stay byte-for-byte unchanged by the new in-sandbox
+// drop-marker behavior.
+func TestNotifyHostBranch_UnreachableSocketExitsZeroWithEmptyStdout(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "no-daemon-here.sock")
+	input := `{"hook_event_name":"Stop","session_id":"host-regression-1"}`
+	cmd := exec.Command(binaryPath, "notify", "-agent", "claude", "-event-socket", socket)
+	cmd.Stdin = strings.NewReader(input)
+	cmd.Env = append(os.Environ(), "CENCI_SANDBOX=")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("notify: %v (stderr: %s)", err, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("expected empty stdout, got: %q", stdout.String())
 	}
 }
 

@@ -94,6 +94,14 @@ import (
 //	                     failure marker); unset/empty simulates "no failure
 //	                     recorded". FAKE_DOCKERD_MARKER_EXIT (default 0) is
 //	                     that same read's exit code.
+//	FAKE_EVENTS_MARKER  → content returned by the short-lived
+//	                     `run --entrypoint /bin/cat ... .cenci-events-
+//	                     undelivered` home-volume read (#1122's dropped-
+//	                     event marker, written in-sandbox by
+//	                     internal/daemon and surfaced by diagnose.go's
+//	                     "Event delivery:" section); unset/empty simulates
+//	                     "no failure recorded". FAKE_EVENTS_MARKER_EXIT
+//	                     (default 0) is that same read's exit code.
 //	FAKE_OBSERVED_POSTURE → `inspect --format ...` stdout for ticket #627's
 //	                     combined observed-inspect probe (Audit's
 //	                     running-container derivation: image reference,
@@ -260,6 +268,7 @@ run)
   *'/bin/cat'*)
     case "$*" in
     *'.cenci-dockerd-startup-error'*) fv DOCKERD_MARKER ""; exit "$(fe DOCKERD_MARKER)" ;;
+    *'.cenci-events-undelivered'*) fv EVENTS_MARKER ""; exit "$(fe EVENTS_MARKER)" ;;
     esac
     ;;
   esac

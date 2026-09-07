@@ -2,6 +2,7 @@ package errcode
 
 import (
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -243,4 +244,86 @@ func TestDindStartupFailureCode_IsInAllCodes(t *testing.T) {
 		}
 	}
 	t.Errorf("AllCodes() does not include SandboxDindStartupFailure (%s); it must be added to allCodes in errcode.go", SandboxDindStartupFailure)
+}
+
+// TestSandboxSocketUnwiredCode_ExistsAndIsRegistered pins ticket #1122's new
+// error identifier: attached by internal/daemon's in-sandbox delivery-failure
+// classifier when a failed hook-event delivery is unrecoverable and
+// container-scoped (the socket-dir bind mount is dangling or absent inside
+// the container) — distinct from the pre-existing, host-scoped
+// DaemonSocketMissing (recoverable via `cenci daemon start`). Must satisfy
+// the CENCI-<AREA>-<SUBAREA>-<NNN> format, resolve to a real (non-empty
+// Message/Causes/Hints) Entry via Lookup, and stay pairwise distinct from
+// every other registered code.
+func TestSandboxSocketUnwiredCode_ExistsAndIsRegistered(t *testing.T) {
+	if SandboxSocketUnwired != "CENCI-SANDBOX-SOCKET-001" {
+		t.Errorf("SandboxSocketUnwired = %q, want CENCI-SANDBOX-SOCKET-001", SandboxSocketUnwired)
+	}
+	if !codeFormat.MatchString(string(SandboxSocketUnwired)) {
+		t.Errorf("SandboxSocketUnwired %q does not match format %s", SandboxSocketUnwired, codeFormat.String())
+	}
+
+	entry, ok := Lookup(SandboxSocketUnwired)
+	if !ok {
+		t.Fatalf("Lookup(%s) = _, false; want true", SandboxSocketUnwired)
+	}
+	if entry.Message == "" {
+		t.Errorf("Lookup(%s).Message is empty", SandboxSocketUnwired)
+	}
+	if len(entry.Causes) == 0 {
+		t.Errorf("Lookup(%s).Causes is empty", SandboxSocketUnwired)
+	}
+	if len(entry.Hints) == 0 {
+		t.Errorf("Lookup(%s).Hints is empty", SandboxSocketUnwired)
+	}
+
+	others := []Code{
+		SandboxStartAgentCLIMissing,
+		SandboxStartGenericEntrypoint,
+		SandboxStartReadinessTimeout,
+		SandboxSessionNotFound,
+		SandboxDindStartupFailure,
+		SandboxDindPlatformUnsupported,
+		SandboxDindRuntimeCreateFailed,
+		DaemonConnUnreachable,
+		DaemonSocketMissing,
+	}
+	for _, other := range others {
+		if SandboxSocketUnwired == other {
+			t.Fatalf("SandboxSocketUnwired must be distinct from %q, both = %q", other, other)
+		}
+	}
+}
+
+// TestSandboxSocketUnwiredCode_IsInAllCodes asserts the new constant is
+// wired into allCodes, so AllCodes()-driven exhaustiveness guards elsewhere
+// (severityForCode's exhaustiveness test, and the atlas-sync tests) actually
+// see it.
+func TestSandboxSocketUnwiredCode_IsInAllCodes(t *testing.T) {
+	for _, c := range AllCodes() {
+		if c == SandboxSocketUnwired {
+			return
+		}
+	}
+	t.Errorf("AllCodes() does not include SandboxSocketUnwired (%s); it must be added to allCodes in errcode.go", SandboxSocketUnwired)
+}
+
+// TestSandboxSocketUnwiredCode_HintsNameContainerRecreation pins the ticket's
+// requirement that the registered hints point at recreating the container —
+// the only remediation for a dangling/absent bind mount, since a container's
+// mounts are fixed for its lifetime and can never self-heal.
+func TestSandboxSocketUnwiredCode_HintsNameContainerRecreation(t *testing.T) {
+	entry, ok := Lookup(SandboxSocketUnwired)
+	if !ok {
+		t.Fatalf("Lookup(%s) = _, false; want true", SandboxSocketUnwired)
+	}
+	found := false
+	for _, hint := range entry.Hints {
+		if strings.Contains(hint, "sandbox stop") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Lookup(%s).Hints = %#v; want a hint naming `cenci sandbox stop <name>` (container recreation)", SandboxSocketUnwired, entry.Hints)
+	}
 }

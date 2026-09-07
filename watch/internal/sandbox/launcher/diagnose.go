@@ -8,7 +8,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/matteobortolazzo/cenci/watch/v2/internal/daemon"
 	"github.com/matteobortolazzo/cenci/watch/v2/internal/errcode"
 	"github.com/matteobortolazzo/cenci/watch/v2/internal/ipc"
 )
@@ -52,7 +55,8 @@ func severityForCode(code errcode.Code) Severity {
 	case errcode.SandboxStartAgentCLIMissing, errcode.SandboxStartGenericEntrypoint, errcode.SandboxSessionNotFound,
 		errcode.SandboxDindRuntimeCreateFailed:
 		return SeverityFatal
-	case errcode.SandboxStartReadinessTimeout, errcode.DaemonConnUnreachable, errcode.DaemonSocketMissing, errcode.SandboxDindStartupFailure:
+	case errcode.SandboxStartReadinessTimeout, errcode.DaemonConnUnreachable, errcode.DaemonSocketMissing, errcode.SandboxDindStartupFailure,
+		errcode.SandboxSocketUnwired:
 		return SeverityDegraded
 	default:
 		return SeverityWarning
@@ -206,6 +210,81 @@ func (e *Engine) nestedDockerFinding(scope Scope) (line string, f *finding) {
 		Message:  content,
 		Code:     errcode.SandboxDindStartupFailure,
 		Severity: severityForCode(errcode.SandboxDindStartupFailure),
+	}
+}
+
+// maxEventDeliveryMessageLen bounds the length of an undelivered-events
+// marker's message before it is rendered — the marker crosses the
+// container->host seam (an in-sandbox `cenci notify` writes it, a
+// short-lived container reads it back on the host), so every field is
+// validated rather than trusted verbatim (#1094).
+const maxEventDeliveryMessageLen = 2048
+
+// sanitizeEventDeliveryMessage strips non-printable runes and bounds the
+// length of an undelivered-events marker's message (or code) field before it
+// is rendered, since the marker crosses the container->host seam (#1094).
+// unicode.IsPrint excludes not just ASCII C0 control bytes and DEL, but also
+// the C1 range (U+0080-U+009F, notably U+009B CSI and U+009D OSC, which some
+// terminals still act on) and Unicode bidi/format characters (e.g. U+202E
+// RLO, U+200B, U+2066-U+2069) that could otherwise spoof or manipulate
+// terminal output when a compromised/tampered container writes a crafted
+// field into the marker — a raw "< 0x20 || == 0x7f" predicate misses all of
+// those. The length cap truncates on a rune boundary (walking back from the
+// byte cutoff via utf8.RuneStart, the same technique
+// internal/babysit/automerge.go's sanitizeDetail uses) so a multi-byte UTF-8
+// character straddling the cutoff is never split mid-encoding.
+func sanitizeEventDeliveryMessage(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	out := b.String()
+	if len(out) > maxEventDeliveryMessageLen {
+		cut := maxEventDeliveryMessageLen
+		for cut > 0 && !utf8.RuneStart(out[cut]) {
+			cut--
+		}
+		out = out[:cut]
+	}
+	return out
+}
+
+// eventDeliveryFinding implements #1122's always-on "Event delivery:" line,
+// mirroring nestedDockerFinding's shape: it reads the undelivered-events
+// marker an in-sandbox `cenci notify` may have written after a hook event
+// failed to reach the host daemon. Both the marker's code and message
+// fields cross the container->host seam, so neither is trusted verbatim
+// (#1094): an unparseable marker, or one naming a code that doesn't resolve
+// via errcode.Lookup, is surfaced as an explicit SeverityWarning finding
+// (never silently omitted, #572) rather than a code/severity that was never
+// actually attached.
+func (e *Engine) eventDeliveryFinding(scope Scope) (line string, f *finding) {
+	content, ok := e.readHomeVolumeFile(scope, daemon.UndeliveredEventsMarkerPath)
+	if !ok {
+		return "no failure recorded", nil
+	}
+	m, err := daemon.ParseUndeliveredEventsMarker([]byte(content))
+	if err != nil {
+		return "an undelivered-events marker was found but is unparseable", &finding{
+			Message:  fmt.Sprintf("the undelivered-events marker is present but unparseable: %v", err),
+			Severity: SeverityWarning,
+		}
+	}
+	if _, ok := errcode.Lookup(m.Code); !ok {
+		code := sanitizeEventDeliveryMessage(string(m.Code))
+		return "an undelivered-events marker was found but names an unrecognized code", &finding{
+			Message:  fmt.Sprintf("the undelivered-events marker names an unrecognized code %q", code),
+			Severity: SeverityWarning,
+		}
+	}
+	message := sanitizeEventDeliveryMessage(m.Message)
+	return message, &finding{
+		Message:  message,
+		Code:     m.Code,
+		Severity: severityForCode(m.Code),
 	}
 }
 
@@ -444,6 +523,12 @@ func (e *Engine) Diagnose(scope Scope) error {
 	_, _ = fmt.Fprintf(e.Stdout, "Nested Docker: %s\n", nestedDockerLine)
 	if nestedDockerFnd != nil {
 		findings = append(findings, *nestedDockerFnd)
+	}
+
+	eventDeliveryLine, eventDeliveryFnd := e.eventDeliveryFinding(scope)
+	_, _ = fmt.Fprintf(e.Stdout, "Event delivery: %s\n", eventDeliveryLine)
+	if eventDeliveryFnd != nil {
+		findings = append(findings, *eventDeliveryFnd)
 	}
 
 	if len(findings) == 0 {
