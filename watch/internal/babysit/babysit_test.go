@@ -1106,15 +1106,635 @@ func TestTickKeepsChecksAbsentClockAcrossRepeatedChecksReadFailures(t *testing.T
 	}
 }
 
+// -- #1169: ci-repair dispatch race between a tick and CI turning red -------
+//
+// babysit.go:626's dispatch guard used to be keyed on LastHeadSHA -- but the
+// :660 reset branch advances LastHeadSHA on any tick where checks are not
+// red *yet* (pending, or green-so-far), burning the only edge the guard
+// could fire on. A tick observing checks still pending or green at a head
+// commit, followed by a later tick observing that SAME head commit's checks
+// have turned failing, must still dispatch ci-repair -- previously it never
+// did, and the PR backed off to the 1h ceiling forever. The two tests below
+// drive tick 1 through a REAL tick() call (not fixture pre-seeding) to reach
+// pending/green state, precisely because pre-seeding is what let this bug
+// ship undetected in every pre-existing test.
+
+// TestTickCIRepairDispatchesOnPendingToFailingTransitionSameSHA is #1169's
+// Transition 1 (pending -> failing, same SHA): tick 1 observes
+// ciStatusPending at headSHA (reached via a real tick() call), tick 2
+// observes ciStatusFailing at the identical HeadRefOID. Tick 2 must dispatch
+// exactly one ci-repair, set FixAttempts to 1 and RepairPending to true,
+// stay actionable (no backoff), and print no "quiet -- no new actionable
+// work" line. The absence assertion is paired with a positive one (the
+// automerge-disabled decision line, which recordDecision unconditionally
+// prints every tick) so an accidentally-empty stdout capture cannot pass
+// vacuously.
+func TestTickCIRepairDispatchesOnPendingToFailingTransitionSameSHA(t *testing.T) {
+	headSHA := "sha-transition-pending"
+	var calls [][]string
+	withScriptedCommands(t, []scriptedCall{
+		// Tick 1: checks still pending at headSHA.
+		{out: cleanOpenPR(headSHA)},
+		{out: `[{"bucket":"pending","name":"test","state":"PENDING"}]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 2: same head SHA, checks now failing -- #1169's exact race.
+		{out: cleanOpenPR(headSHA)},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+	}, &calls)
+	// withScriptedCommands (unlike withCommands) installs no tmux seam
+	// defaults (babysit_test.go's withCommands doc comment), so the launch
+	// probe and target must be stubbed/set explicitly here.
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60, LaunchSession: "work"}
+
+	// Tick 1 reaches ciStatusPending through a real tick() call.
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if s.CIStatus != ciStatusPending {
+		t.Fatalf("tick 1: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusPending)
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != 0 {
+		t.Fatalf("tick 1: ci-repair launches = %d, want 0 (test setup): %#v", n, calls)
+	}
+
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = w
+	_, delay, err := tick(&s)
+	_ = w.Close()
+	os.Stdout = originalStdout
+	out, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatalf("read captured stdout: %v", readErr)
+	}
+
+	if err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if s.CIStatus != ciStatusFailing {
+		t.Fatalf("tick 2: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusFailing)
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != 1 {
+		t.Fatalf("tick 2: ci-repair launches = %d, want exactly 1: a failing CI result at an already-observed head SHA must still dispatch a repair (#1169): %#v", n, calls)
+	}
+	if s.FixAttempts != 1 {
+		t.Fatalf("tick 2: FixAttempts = %d, want 1", s.FixAttempts)
+	}
+	if !s.RepairPending {
+		t.Fatal("tick 2: RepairPending = false, want true")
+	}
+	if delay != time.Duration(s.IntervalSeconds)*time.Second || s.CurrentDelaySeconds != s.IntervalSeconds {
+		t.Fatalf("tick 2: delay = %v, CurrentDelaySeconds = %d, want IntervalSeconds (%ds): a dispatched repair must stay actionable, never back off", delay, s.CurrentDelaySeconds, s.IntervalSeconds)
+	}
+	stdout := string(out)
+	if !strings.Contains(stdout, reasonAutomergeDisabled) {
+		t.Fatalf("tick 2 stdout = %q, want it to contain the automerge decision line %q -- otherwise the absence check below could pass vacuously on an empty capture", stdout, reasonAutomergeDisabled)
+	}
+	if strings.Contains(stdout, "quiet — no new actionable work") {
+		t.Fatalf("tick 2 stdout = %q, want no 'quiet' backoff line: dispatching ci-repair means this tick is actionable", stdout)
+	}
+}
+
+// TestTickCIRepairDispatchesOnGreenToFailingTransitionSameSHA is #1169's
+// Transition 2 (green -> failing, same SHA): the same two-tick shape as
+// above, except tick 1 observes ciStatusGreen (e.g. a check that later
+// re-runs and fails, or reports late) rather than pending. A narrow "don't
+// burn the SHA while pending" fix would not close this transition -- the
+// dedicated LastRepairedSHA field must.
+func TestTickCIRepairDispatchesOnGreenToFailingTransitionSameSHA(t *testing.T) {
+	headSHA := "sha-transition-green"
+	var calls [][]string
+	withScriptedCommands(t, []scriptedCall{
+		// Tick 1: checks all green at headSHA.
+		{out: cleanOpenPR(headSHA)},
+		{out: `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 2: same head SHA, a check re-runs/reports late and fails.
+		{out: cleanOpenPR(headSHA)},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+	}, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60, LaunchSession: "work"}
+
+	// Tick 1 reaches ciStatusGreen through a real tick() call.
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if s.CIStatus != ciStatusGreen {
+		t.Fatalf("tick 1: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusGreen)
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != 0 {
+		t.Fatalf("tick 1: ci-repair launches = %d, want 0 (test setup): %#v", n, calls)
+	}
+
+	r, w, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = w
+	_, delay, err := tick(&s)
+	_ = w.Close()
+	os.Stdout = originalStdout
+	out, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatalf("read captured stdout: %v", readErr)
+	}
+
+	if err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if s.CIStatus != ciStatusFailing {
+		t.Fatalf("tick 2: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusFailing)
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != 1 {
+		t.Fatalf("tick 2: ci-repair launches = %d, want exactly 1: a failing CI result at an already-observed (previously green) head SHA must still dispatch a repair (#1169): %#v", n, calls)
+	}
+	if s.FixAttempts != 1 {
+		t.Fatalf("tick 2: FixAttempts = %d, want 1", s.FixAttempts)
+	}
+	if !s.RepairPending {
+		t.Fatal("tick 2: RepairPending = false, want true")
+	}
+	if delay != time.Duration(s.IntervalSeconds)*time.Second || s.CurrentDelaySeconds != s.IntervalSeconds {
+		t.Fatalf("tick 2: delay = %v, CurrentDelaySeconds = %d, want IntervalSeconds (%ds): a dispatched repair must stay actionable, never back off", delay, s.CurrentDelaySeconds, s.IntervalSeconds)
+	}
+	stdout := string(out)
+	if !strings.Contains(stdout, reasonAutomergeDisabled) {
+		t.Fatalf("tick 2 stdout = %q, want it to contain the automerge decision line %q -- otherwise the absence check below could pass vacuously on an empty capture", stdout, reasonAutomergeDisabled)
+	}
+	if strings.Contains(stdout, "quiet — no new actionable work") {
+		t.Fatalf("tick 2 stdout = %q, want no 'quiet' backoff line: dispatching ci-repair means this tick is actionable", stdout)
+	}
+}
+
+// TestTickCIRepairNoDispatchStormOnRepeatedFailingSameSHA is the "no
+// dispatch storm" AC: a third tick, still failing at the same head SHA
+// after a repair was already dispatched, must launch no second ci-repair,
+// must leave FixAttempts unchanged, and must still report actionable (no
+// backoff) via the pre-existing RepairPending term at tick's :614. State is
+// pre-seeded to exactly what a prior dispatch tick would have left behind
+// (LastHeadSHA and LastRepairedSHA both pinned to headSHA, per
+// watch/docs/test-strategy.md's rule against pinning only one dependent
+// identity field), so this tick exercises only the storm guard.
+func TestTickCIRepairNoDispatchStormOnRepeatedFailingSameSHA(t *testing.T) {
+	headSHA := "sha-storm"
+	var calls [][]string
+	withScriptedCommands(t, []scriptedCall{
+		{out: cleanOpenPR(headSHA)},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+	}, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 900,
+		LastHeadSHA: headSHA, LastRepairedSHA: headSHA,
+		FixAttempts: 1, RepairPending: true,
+		LaunchSession: "work",
+	}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != 0 {
+		t.Fatalf("ci-repair launches = %d, want 0: a repair was already dispatched for this head SHA, a repeated failing tick must not launch a second one: %#v", n, calls)
+	}
+	if s.FixAttempts != 1 {
+		t.Fatalf("FixAttempts = %d, want unchanged 1", s.FixAttempts)
+	}
+	if !s.RepairPending {
+		t.Fatal("RepairPending = false, want unchanged true")
+	}
+	if s.CurrentDelaySeconds != s.IntervalSeconds {
+		t.Fatalf("CurrentDelaySeconds = %d, want %d (IntervalSeconds): still actionable via the existing RepairPending term, no backoff", s.CurrentDelaySeconds, s.IntervalSeconds)
+	}
+}
+
+// TestTickCIRepairReArmsOnNewFailingHeadSHA is the "new push re-arms" AC:
+// after the head SHA changes and checks are still failing, a new ci-repair
+// must dispatch and FixAttempts must increment -- fixCap still bounds
+// repairs across distinct failing commits, unchanged from before #1169.
+func TestTickCIRepairReArmsOnNewFailingHeadSHA(t *testing.T) {
+	oldSHA, newSHA := "sha-old", "sha-new"
+	var calls [][]string
+	withScriptedCommands(t, []scriptedCall{
+		{out: cleanOpenPR(newSHA)},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+	}, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60,
+		LastHeadSHA: oldSHA, LastRepairedSHA: oldSHA,
+		FixAttempts: 1, RepairPending: true,
+		LaunchSession: "work",
+	}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != 1 {
+		t.Fatalf("ci-repair launches = %d, want exactly 1: a new push at a distinct failing head SHA must re-arm dispatch: %#v", n, calls)
+	}
+	if s.FixAttempts != 2 {
+		t.Fatalf("FixAttempts = %d, want 2: fixCap must still bound repairs across distinct failing commits", s.FixAttempts)
+	}
+	if s.LastHeadSHA != newSHA || s.LastRepairedSHA != newSHA {
+		t.Fatalf("LastHeadSHA/LastRepairedSHA = %q/%q, want both %q", s.LastHeadSHA, s.LastRepairedSHA, newSHA)
+	}
+}
+
+// TestTickCIRepairRetryBudgetSurvivesPendingTickBetweenFailingSHAs is a
+// code-review follow-up to #1169: a pending tick landing between two
+// distinct failing head SHAs (the repair agent pushed a fix, CI has not
+// turned red -- or green -- yet) must not reset the retry budget. Before
+// this fix, the :660 reset branch fired unconditionally on any head-SHA
+// change, including a still-pending one, silently zeroing FixAttempts and
+// making fixCap unreachable on a persistently-red PR: a pending tick
+// between two failing commits is the very same tick/CI race #1169 itself
+// closed for the dispatch guard, not an edge case for the reset branch.
+// This overrides the ticket's original Assumption that "the :660 reset
+// branch keeps advancing LastHeadSHA unchanged; only the :626 guard's
+// comparand changes" -- that assumption is incompatible with fixCap's own
+// AC ("still bounds repairs across distinct failing commits").
+func TestTickCIRepairRetryBudgetSurvivesPendingTickBetweenFailingSHAs(t *testing.T) {
+	var calls [][]string
+	withScriptedCommands(t, []scriptedCall{
+		// Tick 1: sha-1 failing -- dispatch #1.
+		{out: cleanOpenPR("sha-1")},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 2: sha-2, checks still pending -- the repair agent pushed,
+		// CI has not turned red (or green) yet.
+		{out: cleanOpenPR("sha-2")},
+		{out: `[{"bucket":"pending","name":"test","state":"PENDING"}]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 3: sha-2, checks now failing -- dispatch #2 (a distinct SHA
+		// from sha-1's LastRepairedSHA).
+		{out: cleanOpenPR("sha-2")},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+	}, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60, LaunchSession: "work"}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if s.FixAttempts != 1 {
+		t.Fatalf("tick 1: FixAttempts = %d, want 1 (test setup)", s.FixAttempts)
+	}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if s.CIStatus != ciStatusPending {
+		t.Fatalf("tick 2: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusPending)
+	}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != 2 {
+		t.Fatalf("ci-repair launches = %d, want exactly 2: a pending tick between two failing SHAs must not reset the retry budget: %#v", n, calls)
+	}
+	if s.FixAttempts != 2 {
+		t.Fatalf("FixAttempts = %d, want 2: a still-pending tick at a new head SHA must not reset the retry budget -- only a GREEN observation proves the repair succeeded", s.FixAttempts)
+	}
+}
+
+// TestTickCIRepairRetryBudgetSurvivesUnknownCIAtNewHeadSHA pins the other
+// deliberately-conservative half of the reset gate: a new head SHA observed
+// with zero checks (ciStatusUnknown, #924) must not reset the retry budget
+// either -- only a genuine GREEN observation proves the repair succeeded,
+// not merely "CI hasn't reported red yet". LastHeadSHA must ALSO stay
+// unchanged (a second code-review follow-up to #1169): the reset branch's
+// `pr.HeadRefOID != s.LastHeadSHA` comparison is its own only trigger for a
+// given SHA, so advancing LastHeadSHA on this non-green tick would
+// permanently spend that trigger for sha-new -- a LATER tick observing
+// sha-new has actually gone green could then never re-enter the branch,
+// leaving RepairPending stuck true forever (see
+// TestTickCIRepairGreenAfterUnknownAtNewSHAStillResetsBudget, which pins
+// that exact chained scenario end to end).
+func TestTickCIRepairRetryBudgetSurvivesUnknownCIAtNewHeadSHA(t *testing.T) {
+	oldSHA, newSHA := "sha-old", "sha-new"
+	var calls [][]string
+	withCommands(t, []string{cleanOpenPR(newSHA), `[]`, `[]`, `[]`}, &calls)
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60,
+		LastHeadSHA: oldSHA, LastRepairedSHA: oldSHA,
+		FixAttempts: 1, RepairPending: true,
+	}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if s.CIStatus != ciStatusUnknown {
+		t.Fatalf("CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusUnknown)
+	}
+	if s.FixAttempts != 1 {
+		t.Fatalf("FixAttempts = %d, want unchanged 1: a zero-checks (ciStatusUnknown) observation at a new head SHA must not reset the retry budget", s.FixAttempts)
+	}
+	if !s.RepairPending {
+		t.Fatal("RepairPending = false, want unchanged true")
+	}
+	if s.LastHeadSHA != oldSHA {
+		t.Fatalf("LastHeadSHA = %q, want unchanged %q: the reset branch must not advance LastHeadSHA on a non-green tick, or a LATER green observation at %s could never re-enter the branch", s.LastHeadSHA, oldSHA, newSHA)
+	}
+}
+
+// TestTickCIRepairSuccessfulRepairResetsFixAttemptsAndRepairPending is the
+// "successful repair resets" AC: a tick observing a new head SHA with CI
+// actually GREEN must still reset FixAttempts to 0 and RepairPending to
+// false -- no regression in the automerge reasonRepairPending release
+// path. The reset is now explicitly gated on ciStatusGreen (a code-review
+// follow-up to #1169: a pending or unknown observation at a new head SHA
+// must NOT reset the budget, see
+// TestTickCIRepairRetryBudgetSurvivesPendingTickBetweenFailingSHAs/
+// TestTickCIRepairRetryBudgetSurvivesUnknownCIAtNewHeadSHA above).
+// LastRepairedSHA is untouched by this branch, so it still names the
+// superseded SHA and is simply never matched again.
+func TestTickCIRepairSuccessfulRepairResetsFixAttemptsAndRepairPending(t *testing.T) {
+	oldSHA, newSHA := "sha-old", "sha-fixed"
+	var calls [][]string
+	withCommands(t, []string{cleanOpenPR(newSHA), `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`, `[]`, `[]`}, &calls)
+	s := State{
+		PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60,
+		LastHeadSHA: oldSHA, LastRepairedSHA: oldSHA,
+		FixAttempts: 1, RepairPending: true,
+	}
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if s.FixAttempts != 0 {
+		t.Fatalf("FixAttempts = %d, want reset to 0", s.FixAttempts)
+	}
+	if s.RepairPending {
+		t.Fatal("RepairPending = true, want reset to false: the automerge reasonRepairPending release path depends on this")
+	}
+	if s.LastHeadSHA != newSHA {
+		t.Fatalf("LastHeadSHA = %q, want %q", s.LastHeadSHA, newSHA)
+	}
+	if s.LastRepairedSHA != oldSHA {
+		t.Fatalf("LastRepairedSHA = %q, want unchanged %q", s.LastRepairedSHA, oldSHA)
+	}
+}
+
+// TestTickCIRepairGreenAfterPendingAtNewSHAStillResetsBudget is a second
+// code-review follow-up to #1169: a GREEN observation must still be able to
+// reset the retry budget even when an earlier tick already saw that same
+// new head SHA as pending. Before this fix, the :680 reset branch's
+// `s.LastHeadSHA = pr.HeadRefOID` line ran unconditionally, outside the
+// `if s.CIStatus == ciStatusGreen` guard -- so the PENDING tick at sha-2
+// already advanced LastHeadSHA to sha-2, permanently spending the branch's
+// only trigger for that SHA (`pr.HeadRefOID != s.LastHeadSHA`). The later
+// GREEN tick at that same sha-2 could then never re-enter the branch, and
+// RepairPending stayed stuck true forever -- blocking automerge.go:543's
+// `!RepairPending` gate on any PR that took more than one poll to settle
+// green after a repair, which is the ordinary case (CI virtually always
+// reports pending at least once before passing). All three ticks are real
+// tick() calls -- driving this precondition through fixture pre-seeding
+// (as TestTickCIRepairSuccessfulRepairResetsFixAttemptsAndRepairPending
+// above does, for an unrelated, narrower single-tick scenario) would land
+// directly on the branch's first observation of the new SHA and never
+// exercise the intervening non-green tick that actually breaks this.
+func TestTickCIRepairGreenAfterPendingAtNewSHAStillResetsBudget(t *testing.T) {
+	var calls [][]string
+	withScriptedCommands(t, []scriptedCall{
+		// Tick 1: sha-1 failing -- dispatch.
+		{out: cleanOpenPR("sha-1")},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 2: sha-2, checks still pending -- the repair agent pushed,
+		// CI has not settled yet.
+		{out: cleanOpenPR("sha-2")},
+		{out: `[{"bucket":"pending","name":"test","state":"PENDING"}]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 3: sha-2, checks now green -- the repair actually succeeded.
+		{out: cleanOpenPR("sha-2")},
+		{out: `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`},
+		{out: `[]`},
+		{out: `[]`},
+	}, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60, LaunchSession: "work"}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if s.FixAttempts != 1 || !s.RepairPending {
+		t.Fatalf("tick 1: FixAttempts=%d RepairPending=%v, want 1/true (test setup)", s.FixAttempts, s.RepairPending)
+	}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if s.CIStatus != ciStatusPending {
+		t.Fatalf("tick 2: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusPending)
+	}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	if s.CIStatus != ciStatusGreen {
+		t.Fatalf("tick 3: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusGreen)
+	}
+	if s.FixAttempts != 0 {
+		t.Fatalf("tick 3: FixAttempts = %d, want 0: a green observation at a head SHA an earlier tick already saw pending must still reset the retry budget", s.FixAttempts)
+	}
+	if s.RepairPending {
+		t.Fatal("tick 3: RepairPending = true, want false: automerge.go:543's !RepairPending gate must release once a repair actually settles green")
+	}
+}
+
+// TestTickCIRepairGreenAfterUnknownAtNewSHAStillResetsBudget is the
+// ciStatusUnknown (#924, zero checks/unreadable) analogue of
+// TestTickCIRepairGreenAfterPendingAtNewSHAStillResetsBudget above: unknown
+// is gated identically to pending in the reset branch, so it must not
+// spend the branch's trigger for that SHA either.
+func TestTickCIRepairGreenAfterUnknownAtNewSHAStillResetsBudget(t *testing.T) {
+	var calls [][]string
+	withScriptedCommands(t, []scriptedCall{
+		// Tick 1: sha-1 failing -- dispatch.
+		{out: cleanOpenPR("sha-1")},
+		{out: `[{"bucket":"fail","name":"test","state":"FAILURE"}]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 2: sha-2, zero checks reported -- ciStatusUnknown (#924).
+		{out: cleanOpenPR("sha-2")},
+		{out: `[]`},
+		{out: `[]`},
+		{out: `[]`},
+		// Tick 3: sha-2, checks now green.
+		{out: cleanOpenPR("sha-2")},
+		{out: `[{"bucket":"pass","name":"test","state":"SUCCESS"}]`},
+		{out: `[]`},
+		{out: `[]`},
+	}, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60, LaunchSession: "work"}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 1: %v", err)
+	}
+	if s.FixAttempts != 1 || !s.RepairPending {
+		t.Fatalf("tick 1: FixAttempts=%d RepairPending=%v, want 1/true (test setup)", s.FixAttempts, s.RepairPending)
+	}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 2: %v", err)
+	}
+	if s.CIStatus != ciStatusUnknown {
+		t.Fatalf("tick 2: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusUnknown)
+	}
+
+	if _, _, err := tick(&s); err != nil {
+		t.Fatalf("tick 3: %v", err)
+	}
+	if s.CIStatus != ciStatusGreen {
+		t.Fatalf("tick 3: CIStatus = %q, want %q (test setup)", s.CIStatus, ciStatusGreen)
+	}
+	if s.FixAttempts != 0 {
+		t.Fatalf("tick 3: FixAttempts = %d, want 0: a green observation at a head SHA an earlier tick already saw ciStatusUnknown must still reset the retry budget", s.FixAttempts)
+	}
+	if s.RepairPending {
+		t.Fatal("tick 3: RepairPending = true, want false")
+	}
+}
+
+// TestTickCIRepairRetryCapReachedOnlyAfterDistinctFailingHeadSHAs is the
+// "retry cap still per-distinct-SHA" AC: fixCap escalation must count
+// distinct failing head commits, never repeated ticks at one SHA (Decision:
+// "cap semantics stay per-commit, not per-tick"). Drives fixCap distinct
+// failing SHAs to reach the cap; each round interleaves TWO kinds of tick
+// that must not advance FixAttempts: a repeated tick at the same SHA
+// (storm check) AND a PENDING tick at the next round's SHA (the
+// coordinator's code-review follow-up: the repair agent pushed, CI has not
+// reported red -- or green -- yet, the common case, not an edge case).
+// A final distinct failing SHA then trips the retry-cap escalation (launch
+// babysit-attention, set Status to "needs-input", return errNeedsInput).
+func TestTickCIRepairRetryCapReachedOnlyAfterDistinctFailingHeadSHAs(t *testing.T) {
+	shas := []string{"sha-1", "sha-2", "sha-3", "sha-4"}
+	if len(shas) != fixCap+1 {
+		t.Fatalf("test setup: need exactly fixCap+1 (%d) distinct SHAs, got %d", fixCap+1, len(shas))
+	}
+	failJSON := `[{"bucket":"fail","name":"test","state":"FAILURE"}]`
+	pendingJSON := `[{"bucket":"pending","name":"test","state":"PENDING"}]`
+	var script []scriptedCall
+	for i, sha := range shas[:fixCap] {
+		// Dispatch tick: a distinct failing SHA.
+		script = append(script, scriptedCall{out: cleanOpenPR(sha)}, scriptedCall{out: failJSON}, scriptedCall{out: `[]`}, scriptedCall{out: `[]`})
+		// Repeated tick at the same SHA, still failing (storm check).
+		script = append(script, scriptedCall{out: cleanOpenPR(sha)}, scriptedCall{out: failJSON}, scriptedCall{out: `[]`}, scriptedCall{out: `[]`})
+		// A pending tick at the NEXT round's SHA.
+		nextSHA := shas[i+1]
+		script = append(script, scriptedCall{out: cleanOpenPR(nextSHA)}, scriptedCall{out: pendingJSON}, scriptedCall{out: `[]`}, scriptedCall{out: `[]`})
+	}
+	// The cap-reached tick: the final SHA now failing, returns early right
+	// after the checks fetch -- no comments/reviews fetch.
+	finalSHA := shas[fixCap]
+	script = append(script, scriptedCall{out: cleanOpenPR(finalSHA)}, scriptedCall{out: failJSON})
+
+	var calls [][]string
+	withScriptedCommands(t, script, &calls)
+	originalTmuxHasSession := tmuxHasSession
+	tmuxHasSession = func(string) (bool, error) { return true, nil }
+	t.Cleanup(func() { tmuxHasSession = originalTmuxHasSession })
+
+	s := State{PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 60, LaunchSession: "work"}
+	for i, sha := range shas[:fixCap] {
+		if _, _, err := tick(&s); err != nil {
+			t.Fatalf("dispatch tick %d (%s): %v", i+1, sha, err)
+		}
+		if s.FixAttempts != i+1 {
+			t.Fatalf("after dispatch tick %d (%s): FixAttempts = %d, want %d", i+1, sha, s.FixAttempts, i+1)
+		}
+
+		if _, _, err := tick(&s); err != nil {
+			t.Fatalf("repeated tick at %s: %v", sha, err)
+		}
+		if s.FixAttempts != i+1 {
+			t.Fatalf("after repeated tick at %s: FixAttempts = %d, want unchanged %d: the cap must count distinct failing SHAs, never repeated ticks", sha, s.FixAttempts, i+1)
+		}
+
+		nextSHA := shas[i+1]
+		if _, _, err := tick(&s); err != nil {
+			t.Fatalf("pending tick at %s: %v", nextSHA, err)
+		}
+		if s.CIStatus != ciStatusPending {
+			t.Fatalf("pending tick at %s: CIStatus = %q, want %q (test setup)", nextSHA, s.CIStatus, ciStatusPending)
+		}
+		if s.FixAttempts != i+1 {
+			t.Fatalf("after pending tick at %s: FixAttempts = %d, want unchanged %d: a pending tick at a new head SHA must not reset the retry budget", nextSHA, s.FixAttempts, i+1)
+		}
+	}
+	if s.FixAttempts != fixCap {
+		t.Fatalf("FixAttempts = %d, want %d at the cap", s.FixAttempts, fixCap)
+	}
+
+	_, _, err := tick(&s)
+	if !errors.Is(err, errNeedsInput) {
+		t.Fatalf("tick at the fixCap+1-th distinct SHA (%s): err = %v, want errors.Is(err, errNeedsInput)", finalSHA, err)
+	}
+	if s.Status != "needs-input" {
+		t.Fatalf("Status = %q, want %q", s.Status, "needs-input")
+	}
+	if n := countWorkflowLaunches(calls, "ci-repair"); n != fixCap {
+		t.Fatalf("ci-repair launches = %d, want exactly %d (one per distinct failing SHA): %#v", n, fixCap, calls)
+	}
+	if n := countWorkflowLaunches(calls, "babysit-attention"); n != 1 {
+		t.Fatalf("babysit-attention launches = %d, want exactly 1: %#v", n, calls)
+	}
+}
+
 // TestTickFailingCIActionableOnlyWhileRepairPending exercises the
 // RepairPending scoping in both directions, on a tick where the head SHA is
-// unchanged (LastHeadSHA pinned to the fixture PR's headRefOid, per
-// watch/docs/test-strategy.md's fixture-pinning rule) so the pre-existing
-// "new failing head" branch never fires and only the new actionable-seeding
-// logic is under test: a failing CIStatus is actionable while RepairPending
-// is true (the supervisor keeps polling at IntervalSeconds, since a repair
-// agent is expected to push), and still backs off when RepairPending is
-// false.
+// unchanged (LastHeadSHA AND LastRepairedSHA both pinned to the fixture
+// PR's headRefOid, per watch/docs/test-strategy.md's rule against pinning
+// only one dependent identity field (#824): LastRepairedSHA alone would
+// leave LastHeadSHA at its zero value, and the :660 reset branch would then
+// fire and clobber RepairPending back to false regardless of tc.repairPending,
+// before the actionable logic under test ever runs) so neither the :626
+// dispatch guard nor the :660 reset branch fires, and only the new
+// actionable-seeding logic is under test: a failing CIStatus is actionable
+// while RepairPending is true (the supervisor keeps polling at
+// IntervalSeconds, since a repair agent is expected to push), and still
+// backs off when RepairPending is false.
 func TestTickFailingCIActionableOnlyWhileRepairPending(t *testing.T) {
 	prWithIssue := `{"number":42,"title":"Change","state":"OPEN","headRefName":"feature","headRefOid":"abc","url":"https://example/pr/42","closingIssuesReferences":[{"number":782}]}`
 	failJSON := `[{"bucket":"fail","name":"test","state":"FAILURE"}]`
@@ -1136,8 +1756,9 @@ func TestTickFailingCIActionableOnlyWhileRepairPending(t *testing.T) {
 			}, &calls)
 			s := State{
 				PR: "42", Repo: "o/r", Agent: "codex", IntervalSeconds: 60, CurrentDelaySeconds: 900,
-				LastHeadSHA:   "abc",
-				RepairPending: tc.repairPending,
+				LastHeadSHA:     "abc",
+				LastRepairedSHA: "abc",
+				RepairPending:   tc.repairPending,
 			}
 			if _, _, err := tick(&s); err != nil {
 				t.Fatalf("tick: %v", err)
@@ -2904,6 +3525,13 @@ func TestTickConflictPrecedesCIRepairAndRetryCapOnNewSHA(t *testing.T) {
 			}
 			if s.LastHeadSHA != "new-sha" {
 				t.Fatalf("LastHeadSHA = %q, want %q: bookkeeping must still advance literally (Q&A 1)", s.LastHeadSHA, "new-sha")
+			}
+			// #1169: LastRepairedSHA is set inside the failing-checks branch
+			// only, including on this conflict-suppressed path (the ticket's
+			// Assumptions section), matching Q&A 1's "bookkeeping still
+			// advances literally" rule.
+			if s.LastRepairedSHA != "new-sha" {
+				t.Fatalf("LastRepairedSHA = %q, want %q: #1169 bookkeeping must still advance on the conflict-suppressed path too", s.LastRepairedSHA, "new-sha")
 			}
 			if s.ConflictNotifiedSHA != "new-sha" {
 				t.Fatalf("ConflictNotifiedSHA = %q, want %q", s.ConflictNotifiedSHA, "new-sha")

@@ -48,18 +48,41 @@ type Options struct {
 	Dir string
 }
 type State struct {
-	SchemaVersion       int      `json:"schemaVersion"`
-	PR                  string   `json:"pr"`
-	Repo                string   `json:"repo"`
-	Agent               string   `json:"agent"`
-	IntervalSeconds     int64    `json:"intervalSeconds"`
-	CurrentDelaySeconds int64    `json:"currentDelaySeconds"`
-	LastHeadSHA         string   `json:"lastCiHeadSha,omitempty"`
-	FixAttempts         int      `json:"ciFixAttempts"`
-	RepairPending       bool     `json:"ciRepairPending"`
-	LastCommentAt       string   `json:"lastCommentTimestamp,omitempty"`
-	AddressedKeys       []string `json:"addressedCommentKeys,omitempty"`
-	PendingKeys         []string `json:"pendingCommentKeys,omitempty"`
+	SchemaVersion       int    `json:"schemaVersion"`
+	PR                  string `json:"pr"`
+	Repo                string `json:"repo"`
+	Agent               string `json:"agent"`
+	IntervalSeconds     int64  `json:"intervalSeconds"`
+	CurrentDelaySeconds int64  `json:"currentDelaySeconds"`
+	LastHeadSHA         string `json:"lastCiHeadSha,omitempty"`
+	// LastRepairedSHA (#1169) is the head commit SHA the failing-checks
+	// branch below last dispatched a ci-repair launch for -- purely
+	// additive `omitempty`, no stateSchemaVersion bump, mirroring
+	// ConflictNotifiedSHA/ChecksAbsentHeadSHA above: its zero value already
+	// means "never repaired", so no migration is needed for a state file
+	// written before this field existed. Dedicated rather than reusing
+	// LastHeadSHA, which keeps its own separate job of gating the retry-
+	// budget reset (the reset branch below).
+	//
+	// The two were never safe to conflate. Before #1169 the dispatch guard
+	// keyed on LastHeadSHA, which that reset branch advanced on *every*
+	// tick where checks were not red yet -- pending, or green-so-far. A
+	// fresh push therefore burned the only edge the guard could fire on
+	// before CI had reported anything, and a red result arriving later at
+	// that same head commit was unreachable forever: babysit went quiet on
+	// a failing PR and backed off to the 1h ceiling (#1169's root cause).
+	// Splitting the two fixed that; the reset branch below no longer
+	// advances LastHeadSHA on a non-green tick at all -- see its own
+	// comment for why that staleness is deliberate.
+	//
+	// Set only inside the failing-checks branch, including on the #995
+	// conflict-suppressed path (bookkeeping still advances literally).
+	LastRepairedSHA string   `json:"lastRepairedCiHeadSha,omitempty"`
+	FixAttempts     int      `json:"ciFixAttempts"`
+	RepairPending   bool     `json:"ciRepairPending"`
+	LastCommentAt   string   `json:"lastCommentTimestamp,omitempty"`
+	AddressedKeys   []string `json:"addressedCommentKeys,omitempty"`
+	PendingKeys     []string `json:"pendingCommentKeys,omitempty"`
 	// LaunchedKeys records which currently-pending keys already had an
 	// address-review workflow dispatched for their *current* resolution
 	// episode (#885). It is launch-dedup bookkeeping ONLY -- a key's
@@ -623,7 +646,7 @@ func tick(s *State) (bool, time.Duration, error) {
 			failing = append(failing, c.Name)
 		}
 	}
-	if len(failing) > 0 && pr.HeadRefOID != s.LastHeadSHA {
+	if len(failing) > 0 && pr.HeadRefOID != s.LastRepairedSHA {
 		if s.FixAttempts >= fixCap {
 			if !conflicting {
 				s.Status = "needs-input"
@@ -650,17 +673,50 @@ func tick(s *State) (bool, time.Duration, error) {
 		// Bookkeeping still advances literally even when the launches above
 		// were skipped for a conflicting PR (#995 Q&A 1): a conflicting,
 		// repeatedly-failing-CI PR still needs FixAttempts/RepairPending/
-		// LastHeadSHA to track this tick's observation, so a later push that
-		// both clears the conflict and still fails CI takes the normal
-		// ci-repair path with accurate bookkeeping.
+		// LastHeadSHA/LastRepairedSHA to track this tick's observation, so a
+		// later push that both clears the conflict and still fails CI takes
+		// the normal ci-repair path with accurate bookkeeping.
 		s.FixAttempts++
 		s.RepairPending = true
 		s.LastHeadSHA = pr.HeadRefOID
+		// #1169: LastRepairedSHA is the dispatch guard's own dedup marker --
+		// distinct from LastHeadSHA above, which the reset branch below
+		// keeps advancing for its unrelated retry-budget-reset job.
+		s.LastRepairedSHA = pr.HeadRefOID
 		actionable = true
 	} else if pr.HeadRefOID != s.LastHeadSHA {
-		s.FixAttempts = 0
-		s.RepairPending = false
-		s.LastHeadSHA = pr.HeadRefOID
+		// Retry-budget reset is gated on CI actually being observed GREEN at
+		// the new head SHA (code-review follow-up to #1169): a still-pending
+		// or ciStatusUnknown (#924) observation only means "CI hasn't
+		// reported red yet", not "the repair succeeded". Resetting
+		// unconditionally on any head-SHA change made fixCap unreachable on
+		// a persistently-red PR, because a pending tick landing between two
+		// distinct failing head SHAs -- the exact tick/CI race #1169 itself
+		// closed for the dispatch guard above -- zeroed FixAttempts every
+		// time, leaving ci-repair dispatch unbounded. Deliberately
+		// conservative: only a genuine green result proves the repair
+		// worked.
+		//
+		// s.LastHeadSHA = pr.HeadRefOID moves INSIDE this if (a second
+		// code-review follow-up to #1169): this branch's `!=` comparison is
+		// its own only trigger, so advancing LastHeadSHA on a non-green tick
+		// permanently spends that trigger for this head SHA -- a later tick
+		// observing that SAME SHA has now gone green can never re-enter the
+		// branch, and RepairPending stays stuck true forever, wedging
+		// automerge.go:543's `!RepairPending` gate on the ordinary case (CI
+		// reports pending at least once before it reports green). LastHeadSHA
+		// has no other reader in this package (grep confirms: only this
+		// branch's own guard and the dispatch branch's unconditional write
+		// above, which always keeps it current on every failing tick
+		// regardless), so leaving it stale across every non-green tick at a
+		// new SHA is coherent: it comes to mean "the last SHA confirmed
+		// green or already dispatched a repair for", not "the last SHA ever
+		// observed".
+		if s.CIStatus == ciStatusGreen {
+			s.FixAttempts = 0
+			s.RepairPending = false
+			s.LastHeadSHA = pr.HeadRefOID
+		}
 	}
 	// Merge-conflict observation and escalation (#995): independent of
 	// automerge.enabled, never returns errNeedsInput -- the loop keeps
